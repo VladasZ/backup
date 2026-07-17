@@ -164,7 +164,7 @@ pub fn list_remote(remote: &SshLocation, job: &str) -> Result<Vec<ArchiveInfo>> 
             name: archive.name,
             checksum: archive.checksum,
             size: archive.size,
-            modified: archive.modified,
+            created: archive.created,
         })
         .collect())
 }

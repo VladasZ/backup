@@ -9,8 +9,8 @@ use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::archive::{
-    Artifact, create_local_archive, restore_archive, verify_archive, verify_checksum,
-    write_checksum,
+    Artifact, create_local_archive, ensure_not_symlink, restore_archive, verify_archive,
+    verify_checksum, write_checksum,
 };
 use crate::config::{BackupJob, CompressionConfig};
 use crate::destination::{apply_retention, list_local};
@@ -45,6 +45,7 @@ fn handle(request: AgentRequest, reader: &mut dyn BufRead, paths: &AppPaths) -> 
             version: env!("CARGO_PKG_VERSION").to_owned(),
         }),
         AgentRequest::ValidateSource { path } => {
+            ensure_not_symlink(&path)?;
             let metadata =
                 fs::metadata(&path).with_context(|| format!("read source {}", path.display()))?;
             if !metadata.is_dir() && !metadata.is_file() {
@@ -78,7 +79,7 @@ fn handle(request: AgentRequest, reader: &mut dyn BufRead, paths: &AppPaths) -> 
                     name: archive.name,
                     checksum: archive.checksum,
                     size: archive.size,
-                    modified: archive.modified,
+                    created: archive.created,
                 })
                 .collect::<Vec<_>>();
             write_success(&archives)
@@ -143,12 +144,14 @@ fn create_and_stream(
     };
     let artifact =
         create_local_archive(&job, &compression, &source, &paths.job_staging(&job.name))?;
-    let stream_result = stream_artifact(&artifact);
-    let archive_cleanup = remove_if_present(&artifact.path);
-    let checksum_cleanup = remove_if_present(&artifact.checksum_path);
-    stream_result?;
-    archive_cleanup?;
-    checksum_cleanup
+    // Open the archive, then unlink both files at once. On Unix the open handle keeps the data
+    // readable while we stream it, and the disk space is freed the moment this process ends, even
+    // if ssh is killed mid-stream. So an interrupted transfer never leaks into remote staging.
+    let file =
+        File::open(&artifact.path).with_context(|| format!("open {}", artifact.path.display()))?;
+    remove_if_present(&artifact.path)?;
+    remove_if_present(&artifact.checksum_path)?;
+    stream_open_archive(file, &WireArtifact::from_artifact(&artifact))
 }
 
 fn stream_existing(archive: &Path, checksum: &str) -> Result<()> {
@@ -171,14 +174,18 @@ fn stream_existing(archive: &Path, checksum: &str) -> Result<()> {
 }
 
 fn stream_artifact(artifact: &Artifact) -> Result<()> {
-    write_success(&WireArtifact::from_artifact(artifact))?;
+    let file = File::open(&artifact.path)?;
+    stream_open_archive(file, &WireArtifact::from_artifact(artifact))
+}
+
+fn stream_open_archive(mut file: File, wire: &WireArtifact) -> Result<()> {
+    write_success(wire)?;
     let mut output = stdout().lock();
-    let mut file = File::open(&artifact.path)?;
     let copied = copy(&mut file, &mut output)?;
-    if copied != artifact.size {
+    if copied != wire.size {
         bail!(
             "archive changed while streaming: expected {} bytes, sent {copied}",
-            artifact.size
+            wire.size
         );
     }
     output.flush()?;

@@ -12,6 +12,7 @@ use crate::config::{BackupJob, Config};
 use crate::lock::AppLock;
 use crate::paths::AppPaths;
 use crate::runner::Runner;
+use crate::state::BackupRetry;
 
 const LOOP_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -78,17 +79,46 @@ fn run_due_jobs(runner: &mut Runner, stopping: &AtomicBool) -> Result<()> {
             break;
         }
         let last = runner.state.last_scheduled(&job.name)?;
-        let Some(latest) = unhandled_slot(&job, last, now)? else {
+        let unhandled = unhandled_slot(&job, last, now)?;
+        let retry = runner.state.backup_retry(&job.name)?;
+        let Some(slot) = due_backup(unhandled, retry, now) else {
             continue;
         };
 
-        runner.state.set_last_scheduled(&job.name, latest)?;
-        info!(job = job.name, scheduled_at = %latest, "queueing scheduled backup");
-        if let Err(error) = runner.run_job(&job) {
-            error!(job = job.name, %error, "scheduled backup failed");
+        info!(job = job.name, scheduled_at = %slot, "queueing scheduled backup");
+        match runner.run_job(&job) {
+            Ok(()) => {
+                runner.state.set_last_scheduled(&job.name, slot)?;
+                runner.state.clear_backup_retry(&job.name)?;
+            }
+            Err(error) => {
+                let previous_attempts = retry
+                    .filter(|retry| retry.slot == slot)
+                    .map_or(0, |retry| retry.attempts);
+                let retry_at =
+                    runner
+                        .state
+                        .record_backup_failure(&job.name, slot, previous_attempts)?;
+                error!(job = job.name, %error, retry_at = %retry_at, "scheduled backup failed; will retry");
+            }
         }
     }
     Ok(())
+}
+
+fn due_backup(
+    unhandled: Option<DateTime<Utc>>,
+    retry: Option<BackupRetry>,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let slot = unhandled?;
+    if let Some(retry) = retry
+        && retry.slot == slot
+        && now < retry.next_retry
+    {
+        return None;
+    }
+    Some(slot)
 }
 
 fn unhandled_slot(
@@ -132,11 +162,39 @@ fn reload_config(runner: &mut Runner) {
 mod tests {
     use std::path::PathBuf;
 
-    use chrono::{TimeZone, Utc};
+    use chrono::{Duration, TimeZone, Utc};
 
-    use super::unhandled_slot;
+    use super::{due_backup, unhandled_slot};
     use crate::config::BackupJob;
     use crate::location::Location;
+    use crate::state::BackupRetry;
+
+    #[test]
+    fn scheduled_backup_backs_off_then_retries() {
+        let slot = Utc.with_ymd_and_hms(2026, 7, 17, 2, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 17, 2, 0, 30).unwrap();
+
+        assert_eq!(due_backup(Some(slot), None, now), Some(slot));
+
+        let waiting = BackupRetry {
+            slot,
+            attempts: 1,
+            next_retry: now + Duration::seconds(60),
+        };
+        assert_eq!(due_backup(Some(slot), Some(waiting), now), None);
+
+        let elapsed = BackupRetry {
+            slot,
+            attempts: 1,
+            next_retry: now - Duration::seconds(1),
+        };
+        assert_eq!(due_backup(Some(slot), Some(elapsed), now), Some(slot));
+
+        let newer = slot + Duration::hours(1);
+        assert_eq!(due_backup(Some(newer), Some(waiting), now), Some(newer));
+
+        assert_eq!(due_backup(None, Some(waiting), now), None);
+    }
 
     #[test]
     fn collapses_multiple_missed_slots_into_the_latest_one() {

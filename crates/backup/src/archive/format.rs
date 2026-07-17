@@ -8,44 +8,41 @@ use std::thread;
 use anyhow::{Context, Error, Result, anyhow};
 use flate2::Compression;
 use flate2::write::GzEncoder;
-use serde_json::to_vec;
 use tar::{Builder, EntryType, Header, HeaderMode};
 use zpaq_rs::compress_stream;
 use zstd::stream::write::Encoder as ZstdEncoder;
 
 use crate::config::{CompressionAlgorithm, CompressionConfig};
 
-use super::Manifest;
 use super::catalog::{FileKind, FileRecord};
 
 pub fn write_compressed_tar(
     output: &Path,
     source: &Path,
     records: &[FileRecord],
-    manifest: &Manifest,
     compression: &CompressionConfig,
 ) -> Result<()> {
     let file = File::create(output).with_context(|| format!("create {}", output.display()))?;
     match compression.algorithm {
         CompressionAlgorithm::None => {
-            let file = write_tar(file, source, records, manifest)?;
+            let file = write_tar(file, source, records)?;
             file.sync_all()?;
         }
         CompressionAlgorithm::Gzip => {
             let encoder = GzEncoder::new(file, Compression::default());
-            let encoder = write_tar(encoder, source, records, manifest)?;
+            let encoder = write_tar(encoder, source, records)?;
             encoder.finish()?.sync_all()?;
         }
         CompressionAlgorithm::Zstd => {
             let encoder = ZstdEncoder::new(file, 0)?;
-            let encoder = write_tar(encoder, source, records, manifest)?;
+            let encoder = write_tar(encoder, source, records)?;
             encoder.finish()?.sync_all()?;
         }
         CompressionAlgorithm::Zpaq => {
             let level = compression
                 .level
                 .context("validated ZPAQ level is missing")?;
-            write_zpaq(file, source, records, manifest, level)?;
+            write_zpaq(file, source, records, level)?;
         }
     }
     OpenOptions::new()
@@ -56,20 +53,14 @@ pub fn write_compressed_tar(
     Ok(())
 }
 
-fn write_zpaq(
-    file: File,
-    source: &Path,
-    records: &[FileRecord],
-    manifest: &Manifest,
-    level: u8,
-) -> Result<()> {
+fn write_zpaq(file: File, source: &Path, records: &[FileRecord], level: u8) -> Result<()> {
     let (reader, writer) = UnixStream::pair().context("create ZPAQ compression pipe")?;
     let method = level.to_string();
     let compressor = thread::spawn(move || {
         compress_stream(reader, file, &method, Some("archive.tar"), None)
             .map_err(|error| error.to_string())
     });
-    let tar_result = write_tar(writer, source, records, manifest).map(drop);
+    let tar_result = write_tar(writer, source, records).map(drop);
     let compression_result = compressor
         .join()
         .map_err(|_| anyhow!("ZPAQ compressor thread panicked"))?;
@@ -77,48 +68,16 @@ fn write_zpaq(
     compression_result.map_err(Error::msg)
 }
 
-fn write_tar<W: Write>(
-    writer: W,
-    source: &Path,
-    records: &[FileRecord],
-    manifest: &Manifest,
-) -> Result<W> {
+fn write_tar<W: Write>(writer: W, source: &Path, records: &[FileRecord]) -> Result<W> {
     let mut builder = Builder::new(writer);
     builder.mode(HeaderMode::Complete);
     builder.follow_symlinks(false);
-    append_manifest(&mut builder, manifest)?;
     let mut hard_links = HashMap::new();
     for record in records {
         append_record(&mut builder, source, record, &mut hard_links)?;
     }
     builder.finish()?;
     builder.into_inner().context("finish TAR archive")
-}
-
-fn append_manifest<W: Write>(builder: &mut Builder<W>, manifest: &Manifest) -> Result<()> {
-    let manifest_data = to_vec(manifest)?;
-    let key = "BACKUP.manifest";
-    let mut length_digits = 1;
-    let mut maximum_length = 10;
-    let rest_length = 3 + key.len() + manifest_data.len();
-    while rest_length + length_digits >= maximum_length {
-        length_digits += 1;
-        maximum_length *= 10;
-    }
-    let length = rest_length + length_digits;
-    let mut data = Vec::with_capacity(length);
-    write!(&mut data, "{length} {key}=")?;
-    data.extend_from_slice(&manifest_data);
-    data.push(b'\n');
-    let mut header = Header::new_ustar();
-    header.set_size(data.len() as u64);
-    header.set_mode(0o644);
-    header.set_uid(0);
-    header.set_gid(0);
-    header.set_mtime(manifest.created_at.timestamp().try_into()?);
-    header.set_entry_type(EntryType::XGlobalHeader);
-    builder.append_data(&mut header, "GlobalHead.0", data.as_slice())?;
-    Ok(())
 }
 
 fn append_record<W: Write>(

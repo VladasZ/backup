@@ -7,7 +7,10 @@ use anyhow::{Context, Result, bail};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::archive::{Artifact, restore_archive, verify_archive, verify_checksum, write_checksum};
+use crate::archive::{
+    Artifact, checksum_file, ensure_not_symlink, restore_archive, verify_archive, verify_checksum,
+    write_checksum,
+};
 use crate::config::{BackupJob, Config};
 use crate::destination::{ArchiveInfo, apply_retention, list_local};
 use crate::location::{Location, SshLocation};
@@ -56,9 +59,14 @@ pub fn list(job: &BackupJob) -> Result<()> {
         return Ok(());
     }
     for located in archives {
+        let note = if located.archive.checksum.is_none() {
+            "  (checksum file missing)"
+        } else {
+            ""
+        };
         println!(
-            "{}  {:>12}  {}  {}",
-            located.archive.modified.to_rfc3339(),
+            "{}  {:>12}  {}  {}{note}",
+            located.archive.created.to_rfc3339(),
             located.archive.size,
             located.destination,
             located.archive.name
@@ -81,7 +89,14 @@ pub fn restore(
     }
     let mut failures = Vec::new();
     for located in candidates {
-        let (artifact, temporary) = match materialize(&located, job, paths) {
+        let checksum = match resolve_checksum(&located, yes)? {
+            Some(checksum) => checksum,
+            None => {
+                failures.push(format!("{}: checksum file missing", located.destination));
+                continue;
+            }
+        };
+        let (artifact, temporary) = match materialize(&located, &checksum, job, paths) {
             Ok(materialized) => materialized,
             Err(error) => {
                 warn!(
@@ -93,7 +108,7 @@ pub fn restore(
                 continue;
             }
         };
-        let verification = verify_checksum(&artifact.path, &artifact.checksum)
+        let verification = verify_checksum(&artifact.path, &checksum)
             .and_then(|()| verify_archive(&artifact.path));
         if let Err(error) = verification {
             if temporary {
@@ -130,31 +145,61 @@ pub fn verify(config: &Config, job_name: Option<&str>, archive_name: Option<&str
         None => config.jobs.iter().collect(),
     };
     let mut verified = 0usize;
+    let mut failures = Vec::new();
     for job in jobs {
         for located in list_archives(job)? {
             if archive_name.is_some_and(|name| name != located.archive.name) {
                 continue;
             }
-            match &located.destination {
-                Location::Local(_) => {
-                    verify_checksum(&located.archive.path, &located.archive.checksum)?;
-                    verify_archive(&located.archive.path)?;
+            match verify_one(&located) {
+                Ok(()) => {
+                    println!(
+                        "verified {} at {}",
+                        located.archive.name, located.destination
+                    );
+                    verified += 1;
                 }
-                Location::Ssh(remote) => {
-                    verify_remote(remote, &located.archive.path, &located.archive.checksum)?
+                Err(error) => {
+                    warn!(
+                        archive = located.archive.name,
+                        destination = %located.destination,
+                        %error,
+                        "archive verification failed"
+                    );
+                    failures.push(format!(
+                        "{} at {}: {error:#}",
+                        located.archive.name, located.destination
+                    ));
                 }
             }
-            println!(
-                "verified {} at {}",
-                located.archive.name, located.destination
-            );
-            verified += 1;
         }
+    }
+    if !failures.is_empty() {
+        bail!(
+            "{} archive(s) failed verification: {}",
+            failures.len(),
+            failures.join("; ")
+        );
     }
     if verified == 0 {
         bail!("no matching archives found");
     }
     Ok(())
+}
+
+fn verify_one(located: &LocatedArchive) -> Result<()> {
+    let checksum = located
+        .archive
+        .checksum
+        .as_deref()
+        .context("checksum file is missing")?;
+    match &located.destination {
+        Location::Local(_) => {
+            verify_checksum(&located.archive.path, checksum)?;
+            verify_archive(&located.archive.path)
+        }
+        Location::Ssh(remote) => verify_remote(remote, &located.archive.path, checksum),
+    }
 }
 
 pub fn prune(config: &Config, job_name: Option<&str>) -> Result<()> {
@@ -175,6 +220,7 @@ pub fn prune(config: &Config, job_name: Option<&str>) -> Result<()> {
 }
 
 fn validate_local_source(source: &Path) -> Result<()> {
+    ensure_not_symlink(source)?;
     let metadata =
         fs::metadata(source).with_context(|| format!("read source {}", source.display()))?;
     if !metadata.is_dir() && !metadata.is_file() {
@@ -244,8 +290,8 @@ fn list_archives(job: &BackupJob) -> Result<Vec<LocatedArchive>> {
     located.sort_by(|left, right| {
         right
             .archive
-            .modified
-            .cmp(&left.archive.modified)
+            .created
+            .cmp(&left.archive.created)
             .then_with(|| right.archive.name.cmp(&left.archive.name))
     });
     Ok(located)
@@ -272,8 +318,46 @@ fn select_archives(job: &BackupJob, name: &str) -> Result<Vec<LocatedArchive>> {
     Ok(selected)
 }
 
+fn resolve_checksum(located: &LocatedArchive, yes: bool) -> Result<Option<String>> {
+    if let Some(checksum) = &located.archive.checksum {
+        return Ok(Some(checksum.clone()));
+    }
+    match &located.destination {
+        Location::Ssh(_) => {
+            warn!(
+                destination = %located.destination,
+                archive = located.archive.name,
+                "checksum file is missing on this remote copy; skipping it"
+            );
+            Ok(None)
+        }
+        Location::Local(_) => {
+            if !yes && !confirm_missing_checksum(located)? {
+                return Ok(None);
+            }
+            let checksum = checksum_file(&located.archive.path)?;
+            Ok(Some(checksum))
+        }
+    }
+}
+
+fn confirm_missing_checksum(located: &LocatedArchive) -> Result<bool> {
+    print!(
+        "The checksum file for {} at {} is missing, so it cannot be checked against a stored fingerprint. The whole archive will still be read to confirm it is not truncated. Restore it anyway? [y/N] ",
+        located.archive.name, located.destination
+    );
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().lock().read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
 fn materialize(
     located: &LocatedArchive,
+    checksum: &str,
     job: &BackupJob,
     paths: &AppPaths,
 ) -> Result<(Artifact, bool)> {
@@ -283,9 +367,9 @@ fn materialize(
                 name: located.archive.name.clone(),
                 path: located.archive.path.clone(),
                 checksum_path: PathBuf::new(),
-                checksum: located.archive.checksum.clone(),
+                checksum: checksum.to_owned(),
                 size: located.archive.size,
-                created_at: located.archive.modified,
+                created_at: located.archive.created,
             },
             false,
         ));
@@ -297,21 +381,16 @@ fn materialize(
         Uuid::new_v4(),
         located.archive.name
     ));
-    fetch_remote(
-        remote,
-        &located.archive.path,
-        &located.archive.checksum,
-        &path,
-    )?;
-    let checksum_path = write_checksum(&path, &located.archive.checksum)?;
+    fetch_remote(remote, &located.archive.path, checksum, &path)?;
+    let checksum_path = write_checksum(&path, checksum)?;
     Ok((
         Artifact {
             name: located.archive.name.clone(),
             path,
             checksum_path,
-            checksum: located.archive.checksum.clone(),
+            checksum: checksum.to_owned(),
             size: located.archive.size,
-            created_at: located.archive.modified,
+            created_at: located.archive.created,
         },
         true,
     ))

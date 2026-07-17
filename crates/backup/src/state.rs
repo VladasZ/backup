@@ -13,6 +13,11 @@ use crate::location::Location;
 
 const RETRY_SECONDS: [i64; 4] = [60, 300, 900, 3600];
 
+fn retry_delay(previous_attempts: u32) -> i64 {
+    let index = usize::try_from(previous_attempts).unwrap_or(usize::MAX);
+    RETRY_SECONDS[index.min(RETRY_SECONDS.len() - 1)]
+}
+
 pub struct State {
     connection: Connection,
 }
@@ -39,6 +44,13 @@ pub struct StatusLine {
     pub archive: String,
     pub created_at: DateTime<Utc>,
     pub pending_destinations: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BackupRetry {
+    pub slot: DateTime<Utc>,
+    pub attempts: u32,
+    pub next_retry: DateTime<Utc>,
 }
 
 impl State {
@@ -79,6 +91,13 @@ CREATE TABLE IF NOT EXISTS deliveries (
 
 CREATE INDEX IF NOT EXISTS deliveries_due
 ON deliveries(status, next_retry);
+
+CREATE TABLE IF NOT EXISTS backup_retries (
+    job TEXT PRIMARY KEY,
+    slot INTEGER NOT NULL,
+    attempts INTEGER NOT NULL,
+    next_retry INTEGER NOT NULL
+);
 "#,
         )?;
         Ok(Self { connection })
@@ -266,9 +285,7 @@ WHERE run_id = ?1 AND destination = ?2"#,
         attempts: u32,
         error: &str,
     ) -> Result<DateTime<Utc>> {
-        let index = usize::try_from(attempts).unwrap_or(usize::MAX);
-        let seconds = RETRY_SECONDS[index.min(RETRY_SECONDS.len() - 1)];
-        let retry_at = Utc::now() + Duration::seconds(seconds);
+        let retry_at = Utc::now() + Duration::seconds(retry_delay(attempts));
         self.connection.execute(
             r#"UPDATE deliveries
 SET attempts = attempts + 1, next_retry = ?3, last_error = ?4
@@ -344,6 +361,60 @@ AND NOT EXISTS (
 ON CONFLICT(job) DO UPDATE SET last_scheduled = excluded.last_scheduled"#,
             params![job, value.timestamp()],
         )?;
+        Ok(())
+    }
+
+    pub fn backup_retry(&self, job: &str) -> Result<Option<BackupRetry>> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT slot, attempts, next_retry FROM backup_retries WHERE job = ?1",
+                [job],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(|(slot, attempts, next_retry)| {
+            Ok(BackupRetry {
+                slot: DateTime::from_timestamp(slot, 0)
+                    .context("state contains an invalid backup retry slot")?,
+                attempts,
+                next_retry: DateTime::from_timestamp(next_retry, 0)
+                    .context("state contains an invalid backup retry timestamp")?,
+            })
+        })
+        .transpose()
+    }
+
+    pub fn record_backup_failure(
+        &self,
+        job: &str,
+        slot: DateTime<Utc>,
+        previous_attempts: u32,
+    ) -> Result<DateTime<Utc>> {
+        let next_retry = Utc::now() + Duration::seconds(retry_delay(previous_attempts));
+        self.connection.execute(
+            r#"INSERT INTO backup_retries (job, slot, attempts, next_retry) VALUES (?1, ?2, ?3, ?4)
+ON CONFLICT(job) DO UPDATE SET
+slot = excluded.slot, attempts = excluded.attempts, next_retry = excluded.next_retry"#,
+            params![
+                job,
+                slot.timestamp(),
+                previous_attempts + 1,
+                next_retry.timestamp()
+            ],
+        )?;
+        Ok(next_retry)
+    }
+
+    pub fn clear_backup_retry(&self, job: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM backup_retries WHERE job = ?1", [job])?;
         Ok(())
     }
 
@@ -442,6 +513,34 @@ mod tests {
         assert_eq!(ready[0].run_id, run_id);
         state.mark_run_complete(run_id).unwrap();
         assert!(state.status().unwrap().is_empty());
+    }
+
+    #[test]
+    fn scheduled_backup_failure_grows_the_retry_delay() {
+        let temporary = tempdir().unwrap();
+        let state = State::open(&temporary.path().join("state.sqlite3")).unwrap();
+        let slot = Utc::now()
+            .with_nanosecond(0)
+            .expect("valid timestamp without nanoseconds");
+
+        assert!(state.backup_retry("documents").unwrap().is_none());
+
+        let first = state.record_backup_failure("documents", slot, 0).unwrap();
+        let recorded = state.backup_retry("documents").unwrap().unwrap();
+        assert_eq!(recorded.attempts, 1);
+        assert_eq!(recorded.slot, slot);
+
+        let second = state
+            .record_backup_failure("documents", slot, recorded.attempts)
+            .unwrap();
+        assert!(second > first);
+        assert_eq!(
+            state.backup_retry("documents").unwrap().unwrap().attempts,
+            2
+        );
+
+        state.clear_backup_retry("documents").unwrap();
+        assert!(state.backup_retry("documents").unwrap().is_none());
     }
 
     #[test]

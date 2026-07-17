@@ -9,13 +9,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, SecondsFormat, Utc};
-use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::config::{BackupJob, CompressionConfig};
 
 use catalog::SourceScanner;
+pub use catalog::ensure_not_symlink;
 pub use checksum::{checksum_file, read_checksum, verify_checksum, write_checksum};
 use format::write_compressed_tar;
 pub use restore::{copy_archive_contents, restore_archive, verify_archive};
@@ -30,17 +30,6 @@ pub struct Artifact {
     pub checksum: String,
     pub size: u64,
     pub created_at: DateTime<Utc>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct Manifest {
-    pub format_version: u32,
-    pub archive_id: Uuid,
-    pub job: String,
-    pub source: String,
-    pub created_at: DateTime<Utc>,
-    pub compression: CompressionConfig,
-    pub entries: usize,
 }
 
 pub fn create_local_archive(
@@ -77,22 +66,8 @@ pub fn create_local_archive(
                 warned_mounts.push(mount.clone());
             }
         }
-        let manifest = Manifest {
-            format_version: 1,
-            archive_id,
-            job: job.name.clone(),
-            source: source.display().to_string(),
-            created_at,
-            compression: compression.clone(),
-            entries: before.records.len(),
-        };
-        let archive_result = write_compressed_tar(
-            &partial_path,
-            source,
-            &before.records,
-            &manifest,
-            compression,
-        );
+        let archive_result =
+            write_compressed_tar(&partial_path, source, &before.records, compression);
         let after = scanner.scan()?;
         if before.records == after.records {
             if let Err(error) = archive_result {

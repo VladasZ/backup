@@ -52,6 +52,7 @@ pub struct SourceScanner {
 
 impl SourceScanner {
     pub fn new(source: &Path, exclusions: &[String]) -> Result<Self> {
+        ensure_not_symlink(source)?;
         let source = fs::canonicalize(source)
             .with_context(|| format!("resolve source {}", source.display()))?;
         let metadata = fs::symlink_metadata(&source)
@@ -138,6 +139,15 @@ impl SourceScanner {
             skipped_mounts,
         })
     }
+}
+
+pub fn ensure_not_symlink(source: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(source)
+        .with_context(|| format!("read source metadata {}", source.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!("source {} must not be a symlink", source.display());
+    }
+    Ok(())
 }
 
 fn record(path: &Path, relative: PathBuf) -> Result<FileRecord> {
@@ -231,4 +241,26 @@ fn decode_mount_field(value: &str) -> String {
         .replace("\\011", "\t")
         .replace("\\012", "\n")
         .replace("\\134", "\\")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    use tempfile::tempdir;
+
+    use super::SourceScanner;
+
+    #[test]
+    fn rejects_a_symlink_source() {
+        let temporary = tempdir().unwrap();
+        let real = temporary.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let link = temporary.path().join("link");
+        symlink(&real, &link).unwrap();
+
+        assert!(SourceScanner::new(&link, &[]).is_err());
+        assert!(SourceScanner::new(&real, &[]).is_ok());
+    }
 }

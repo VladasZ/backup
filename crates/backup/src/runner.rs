@@ -198,9 +198,9 @@ impl Runner {
 }
 
 fn recovered_artifact(path: PathBuf, name: String) -> Result<Artifact> {
-    let sidecar = checksum_path(&path);
-    let checksum = if sidecar.exists() {
-        let checksum = read_checksum(&sidecar)?;
+    let checksum_file_path = checksum_path(&path);
+    let checksum = if checksum_file_path.exists() {
+        let checksum = read_checksum(&checksum_file_path)?;
         verify_checksum(&path, &checksum)?;
         checksum
     } else {
@@ -213,7 +213,7 @@ fn recovered_artifact(path: PathBuf, name: String) -> Result<Artifact> {
     Ok(Artifact {
         name,
         path,
-        checksum_path: sidecar,
+        checksum_path: checksum_file_path,
         checksum,
         size: metadata.len(),
         created_at: metadata.modified()?.into(),

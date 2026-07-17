@@ -18,7 +18,7 @@ retention rule, and optional exclusions.
 - Uncompressed TAR, gzip, zstd, and ZPAQ levels 3, 4, and 5.
 - Infinite retention by default, with optional count or age retention.
 - Durable staging and destination-specific retries.
-- Atomic publication and BLAKE3 checksum sidecars.
+- Atomic publication and BLAKE3 checksum files.
 - Pre/post source catalogs with up to five consistency attempts.
 - Symbolic links, hard links, metadata, ownership, and extended attributes.
 - Gitignore-style exclusions configured per job.
@@ -145,8 +145,10 @@ Each `[[backup]]` record contains:
 - `retention`: optional count or age retention.
 - `exclude`: optional gitignore-style patterns.
 
-A source may be one regular file or a directory. Sockets, device files, FIFOs,
-and other special files fail the archive attempt.
+A source may be one regular file or a directory. The source path itself must not
+be a symlink, and a symlink source is rejected at validate and run time.
+Symlinks found inside the source are stored as symlinks as usual. Sockets, device
+files, FIFOs, and other special files fail the archive attempt.
 
 ### SSH locations
 
@@ -196,6 +198,12 @@ start therefore schedules every configured job once.
 
 All jobs and deliveries use one serial queue. Several missed or overlapping
 slots collapse into one catch-up run.
+
+A slot is only marked handled after the backup for it succeeds. If a scheduled
+backup fails, for example the source is briefly unreachable, the daemon retries
+the same slot with growing delays of 1 minute, 5 minutes, 15 minutes, then every
+hour, until it works or a newer slot arrives. A newer slot cancels the retry of
+an older one, since the catch-up run covers it.
 
 The configuration reloads automatically. An invalid reload is logged and the
 last valid configuration remains active.
@@ -311,17 +319,20 @@ backup restore documents \
   --to ssh://server.example.com/srv/documents
 ```
 
-Restore asks before overwriting existing paths. Use `--yes` for unattended
-confirmation:
+Restore always asks for confirmation before it writes, whether or not the
+target already holds files. Use `--yes` for unattended runs:
 
 ```sh
 backup restore documents --to /srv/documents --yes
 ```
 
-The checksum and complete archive stream are verified before extraction. If
-one destination has a corrupt copy, restore tries another configured
-destination with the same archive. Existing archive paths are overwritten,
-but unrelated files already in the target are not deleted.
+The checksum and complete archive stream are verified before extraction. If a
+copy has no checksum file, restore asks before using it and still reads the
+whole archive to confirm it is not truncated, and `--yes` accepts this. If one
+destination has a corrupt copy, restore tries another configured destination
+with the same archive. Existing archive paths are overwritten, but unrelated
+files already in the target are not deleted. Ownership is restored only when
+running as root, since only root may change a file's owner.
 
 ### Verify
 
@@ -359,6 +370,10 @@ backup install
 backup uninstall
 ```
 
+Install runs the same checks as `backup validate` first, so every SSH remote
+must be reachable and every source and destination must be valid at install
+time. Fix any reported problem before the service is written.
+
 macOS uses:
 
 ```text
@@ -389,8 +404,16 @@ documents-2026-07-17T02:00:00Z-01234567-89ab-cdef-0123-456789abcdef.tar.zst
 ```
 
 Every archive has a neighboring `.blake3` checksum file. Archives and
-checksums are written under partial names, synced, verified, and atomically
-renamed into place.
+checksum files are written under partial names, synced, verified, and atomically
+renamed into place. The checksum file lets the tool detect a damaged archive
+cheaply without unpacking it, both when a copy arrives and later on demand with
+`backup verify`.
+
+Deleting old archives during retention does not read checksum files. If an
+archive ever loses its checksum file, retention, `list`, and delivery keep
+working. `list` marks such an archive, `verify` reports it and exits with an
+error, and `restore` asks before restoring it without a checksum, still reading
+the whole archive to confirm it is not truncated.
 
 Destinations are independent. Failed destinations retry indefinitely:
 
@@ -400,7 +423,7 @@ Destinations are independent. Failed destinations retry indefinitely:
 - Later retries every hour.
 
 Successful destinations are not sent the same archive again. A corrupt
-destination copy is replaced from staging, and a bad checksum sidecar is
+destination copy is replaced from staging, and a bad checksum file is
 repaired after the archive itself is verified.
 
 Staging is deleted only after all destinations finish. Removing a job from the
@@ -433,12 +456,16 @@ Nested mounts below a source are always skipped and logged. There is no version
 1 override.
 
 Symbolic links are stored without following them. Hard links stay hard links.
-Extended attributes use PAX headers. Restoring ownership and some metadata may
-require additional operating system permissions.
+Extended attributes use PAX headers. Ownership is restored only when running as
+root, since only root may change a file's owner. An unprivileged restore keeps
+its own ownership and does not fail on that.
 
 ## Disk space
 
-Sources, staging, and destinations log a warning at 80 percent use.
+Sources, staging, and destinations log a warning at 80 percent use. Use is
+measured as space not available to the service, so space a filesystem reserves
+for root counts as used, and the warning can appear a little earlier than a
+plain disk tool would show.
 
 New archives pause when staging has less free space than the larger of:
 
@@ -517,11 +544,11 @@ backup validate
 An active daemon keeps its previous valid configuration after an invalid
 reload. A fresh daemon start requires a valid configuration.
 
-### Restore cannot preserve ownership
+### Restore does not preserve ownership
 
-The operating system may reject ownership changes from an unprivileged user.
-Restore with suitable permissions or restore into a user-owned directory and
-adjust ownership afterward.
+Only root may change a file's owner, so an unprivileged restore skips ownership
+and the restored files belong to the user running the restore. Run the restore
+as root to keep the original owners, or adjust ownership afterward.
 
 ## Development
 

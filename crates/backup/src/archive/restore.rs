@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{Read, Write, copy, sink};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::process::Command;
 use std::thread;
 
 use anyhow::{Context, Error, Result, anyhow, bail};
@@ -11,16 +12,29 @@ use zpaq_rs::decompress_stream;
 use zstd::stream::read::Decoder as ZstdDecoder;
 
 pub fn restore_archive(archive: &Path, target: &Path) -> Result<()> {
+    // Only root can change a file's owner. As a normal user the chown always fails,
+    // so restoring ownership would only turn a working restore into a failure.
+    let preserve_ownerships = running_as_root();
     with_tar_reader(archive, |reader| {
         let mut tar = Archive::new(reader);
         tar.set_overwrite(true);
-        tar.set_preserve_ownerships(true);
+        tar.set_preserve_ownerships(preserve_ownerships);
         tar.set_preserve_permissions(true);
         tar.set_preserve_mtime(true);
         tar.set_unpack_xattrs(true);
         tar.unpack(target)
             .with_context(|| format!("restore into {}", target.display()))
     })
+}
+
+fn running_as_root() -> bool {
+    Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .is_some_and(|id| id.trim() == "0")
 }
 
 pub fn verify_archive(archive: &Path) -> Result<()> {

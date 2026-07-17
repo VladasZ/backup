@@ -64,9 +64,9 @@ pub struct WireArtifact {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct WireArchiveInfo {
     pub name: String,
-    pub checksum: String,
+    pub checksum: Option<String>,
     pub size: u64,
-    pub modified: DateTime<Utc>,
+    pub created: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

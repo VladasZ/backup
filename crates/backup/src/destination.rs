@@ -15,10 +15,15 @@ use crate::storage::warn_if_high;
 pub struct ArchiveInfo {
     pub name: String,
     pub path: PathBuf,
-    pub checksum: String,
+    pub checksum: Option<String>,
     pub size: u64,
-    pub modified: DateTime<Utc>,
+    pub created: DateTime<Utc>,
 }
+
+const ARCHIVE_EXTENSIONS: [&str; 4] = [".tar", ".tar.gz", ".tar.zst", ".tar.zpaq"];
+
+// Archive names end with "-<uuid>.<ext>". A v4 UUID string is 36 characters, plus one leading dash.
+const UUID_SUFFIX_LEN: usize = 37;
 
 pub fn deliver_local(artifact: &Artifact, destination: &Path, job: &BackupJob) -> Result<()> {
     fs::create_dir_all(destination)
@@ -28,8 +33,8 @@ pub fn deliver_local(artifact: &Artifact, destination: &Path, job: &BackupJob) -
     if target.exists() {
         match verify_checksum(&target, &artifact.checksum) {
             Ok(()) => {
-                ensure_checksum_sidecar(&target, &artifact.checksum)?;
-                apply_retention(destination, job)?;
+                ensure_checksum_file(&target, &artifact.checksum)?;
+                prune_best_effort(destination, job);
                 return Ok(());
             }
             Err(error) => {
@@ -63,10 +68,30 @@ pub fn deliver_local(artifact: &Artifact, destination: &Path, job: &BackupJob) -
         archive = artifact.name,
         "delivered archive"
     );
-    apply_retention(destination, job)
+    prune_best_effort(destination, job);
+    Ok(())
+}
+
+fn prune_best_effort(destination: &Path, job: &BackupJob) {
+    if let Err(error) = apply_retention(destination, job) {
+        warn!(
+            job = job.name,
+            destination = %destination.display(),
+            %error,
+            "cleanup after delivery failed; the archive was still delivered"
+        );
+    }
 }
 
 pub fn list_local(destination: &Path, job: &str) -> Result<Vec<ArchiveInfo>> {
+    let mut archives = scan_archives(destination, job)?;
+    for archive in &mut archives {
+        archive.checksum = read_archive_checksum(&archive.path);
+    }
+    Ok(archives)
+}
+
+fn scan_archives(destination: &Path, job: &str) -> Result<Vec<ArchiveInfo>> {
     if !destination.exists() {
         return Ok(Vec::new());
     }
@@ -84,38 +109,63 @@ pub fn list_local(destination: &Path, job: &str) -> Result<Vec<ArchiveInfo>> {
         if !name.starts_with(&prefix) || !is_archive_name(&name) {
             continue;
         }
-        let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-        let path = entry.path();
-        let checksum = read_checksum(&checksum_path(&path))
-            .with_context(|| format!("read checksum for destination archive {}", path.display()))?;
+        let created = archive_created(&name, job).unwrap_or_else(|| {
+            DateTime::from(metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH))
+        });
         archives.push(ArchiveInfo {
             name,
-            path,
-            checksum,
+            path: entry.path(),
+            checksum: None,
             size: metadata.len(),
-            modified: DateTime::from(modified),
+            created,
         });
     }
     archives.sort_by(|left, right| {
         right
-            .modified
-            .cmp(&left.modified)
+            .created
+            .cmp(&left.created)
             .then_with(|| right.name.cmp(&left.name))
     });
     Ok(archives)
+}
+
+fn archive_created(name: &str, job: &str) -> Option<DateTime<Utc>> {
+    let prefix = format!("{job}-");
+    let rest = name.strip_prefix(&prefix)?;
+    let rest = ARCHIVE_EXTENSIONS
+        .iter()
+        .find_map(|extension| rest.strip_suffix(extension))?;
+    let timestamp = rest.get(..rest.len().checked_sub(UUID_SUFFIX_LEN)?)?;
+    DateTime::parse_from_rfc3339(timestamp)
+        .ok()
+        .map(|value| value.with_timezone(&Utc))
+}
+
+fn read_archive_checksum(archive: &Path) -> Option<String> {
+    let path = checksum_path(archive);
+    if !path.exists() {
+        return None;
+    }
+    match read_checksum(&path) {
+        Ok(checksum) => Some(checksum),
+        Err(error) => {
+            warn!(path = %path.display(), %error, "could not read checksum file; treating archive as unchecked");
+            None
+        }
+    }
 }
 
 pub fn apply_retention(destination: &Path, job: &BackupJob) -> Result<()> {
     let Some(retention) = &job.retention else {
         return Ok(());
     };
-    let archives = list_local(destination, &job.name)?;
+    let archives = scan_archives(destination, &job.name)?;
     let removals = retention_removals(&archives, retention)?;
     for archive in removals {
-        let sidecar = checksum_path(&archive.path);
+        let checksum_file = checksum_path(&archive.path);
         fs::remove_file(&archive.path)
             .with_context(|| format!("remove retained archive {}", archive.path.display()))?;
-        remove_if_present(&sidecar)?;
+        remove_if_present(&checksum_file)?;
         info!(
             job = job.name,
             archive = archive.name,
@@ -140,18 +190,18 @@ fn retention_removals<'archive>(
     let cutoff = Utc::now() - age;
     Ok(archives
         .iter()
-        .filter(|archive| archive.modified < cutoff)
+        .filter(|archive| archive.created < cutoff)
         .collect())
 }
 
-fn ensure_checksum_sidecar(archive: &Path, checksum: &str) -> Result<()> {
-    let sidecar = checksum_path(archive);
-    if sidecar.exists() {
-        let existing = read_checksum(&sidecar)?;
+fn ensure_checksum_file(archive: &Path, checksum: &str) -> Result<()> {
+    let checksum_file = checksum_path(archive);
+    if checksum_file.exists() {
+        let existing = read_checksum(&checksum_file)?;
         if existing != checksum {
             warn!(
-                path = %sidecar.display(),
-                "repairing checksum sidecar that disagrees with verified archive"
+                path = %checksum_file.display(),
+                "repairing checksum file that disagrees with verified archive"
             );
             write_checksum(archive, checksum)?;
         }
@@ -166,7 +216,7 @@ pub fn checksum_path(archive: &Path) -> PathBuf {
 }
 
 pub(crate) fn is_archive_name(name: &str) -> bool {
-    [".tar", ".tar.gz", ".tar.zst", ".tar.zpaq"]
+    ARCHIVE_EXTENSIONS
         .iter()
         .any(|extension| name.ends_with(extension))
 }
@@ -186,14 +236,110 @@ fn remove_if_present(path: &Path) -> Result<()> {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::time::{Duration as StdDuration, SystemTime};
 
     use chrono::{Duration, Utc};
     use tempfile::tempdir;
 
-    use super::{ArchiveInfo, checksum_path, deliver_local, retention_removals};
+    use super::{ArchiveInfo, checksum_path, deliver_local, list_local, retention_removals};
     use crate::archive::{Artifact, checksum_file, read_checksum};
     use crate::config::{BackupJob, RetentionConfig};
     use crate::location::Location;
+
+    fn archive_name(hour: u32, tag: char) -> String {
+        let group = |count: usize| std::iter::repeat_n(tag, count).collect::<String>();
+        let uuid = format!(
+            "{}-{}-{}-{}-{}",
+            group(8),
+            group(4),
+            group(4),
+            group(4),
+            group(12)
+        );
+        format!("job-2026-07-17T{hour:02}:00:00Z-{uuid}.tar")
+    }
+
+    #[test]
+    fn missing_checksum_on_a_sibling_does_not_break_delivery_cleanup_or_list() {
+        let temporary = tempdir().unwrap();
+        let staging = temporary.path().join("staging");
+        let destination = temporary.path().join("destination");
+        fs::create_dir_all(&staging).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+
+        let orphan = archive_name(1, '0');
+        fs::write(destination.join(&orphan), "old archive").unwrap();
+
+        let fresh = archive_name(2, '1');
+        let archive_path = staging.join(&fresh);
+        fs::write(&archive_path, "new archive").unwrap();
+        let checksum = checksum_file(&archive_path).unwrap();
+        let artifact = Artifact {
+            name: fresh.clone(),
+            path: archive_path,
+            checksum_path: PathBuf::new(),
+            checksum,
+            size: 11,
+            created_at: Utc::now(),
+        };
+        let job = BackupJob {
+            name: "job".to_owned(),
+            source: Location::Local(PathBuf::from("/source")),
+            destinations: vec![Location::Local(destination.clone())],
+            cron: "0 0 * * *".to_owned(),
+            retention: Some(RetentionConfig {
+                count: Some(5),
+                age: None,
+            }),
+            exclude: Vec::new(),
+        };
+
+        deliver_local(&artifact, &destination, &job).unwrap();
+        assert!(destination.join(&fresh).exists());
+
+        let archives = list_local(&destination, "job").unwrap();
+        assert_eq!(archives.len(), 2);
+        assert!(
+            archives
+                .iter()
+                .find(|archive| archive.name == orphan)
+                .unwrap()
+                .checksum
+                .is_none()
+        );
+        assert!(
+            archives
+                .iter()
+                .find(|archive| archive.name == fresh)
+                .unwrap()
+                .checksum
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn newest_is_chosen_by_name_timestamp_not_file_time() {
+        let temporary = tempdir().unwrap();
+        let newer_name = archive_name(5, 'a');
+        let older_name = archive_name(1, 'b');
+        fs::write(temporary.path().join(&newer_name), "a").unwrap();
+        fs::write(temporary.path().join(&older_name), "b").unwrap();
+
+        // Give the older-named archive the newest file time, the exact case retention used to
+        // misread. Ordering must still follow the timestamp in the name, not the file time.
+        fs::File::open(temporary.path().join(&older_name))
+            .unwrap()
+            .set_modified(SystemTime::now())
+            .unwrap();
+        fs::File::open(temporary.path().join(&newer_name))
+            .unwrap()
+            .set_modified(SystemTime::now() - StdDuration::from_secs(3600))
+            .unwrap();
+
+        let archives = list_local(temporary.path(), "job").unwrap();
+        assert_eq!(archives[0].name, newer_name);
+        assert_eq!(archives[1].name, older_name);
+    }
 
     #[test]
     fn count_retention_keeps_newest_archives() {
@@ -202,9 +348,9 @@ mod tests {
             .map(|offset| ArchiveInfo {
                 name: format!("job-{offset}.tar"),
                 path: directory.path().join(format!("job-{offset}.tar")),
-                checksum: "unused".to_owned(),
+                checksum: None,
                 size: 1,
-                modified: Utc::now() - Duration::minutes(offset),
+                created: Utc::now() - Duration::minutes(offset),
             })
             .collect();
         let retention = RetentionConfig {
@@ -217,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn delivery_replaces_a_corrupt_copy_and_repairs_its_sidecar() {
+    fn delivery_replaces_a_corrupt_copy_and_repairs_its_checksum_file() {
         let temporary = tempdir().unwrap();
         let staging = temporary.path().join("staging");
         let destination = temporary.path().join("destination");
