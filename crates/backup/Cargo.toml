@@ -1,0 +1,36 @@
+[package]
+name = "backup"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+blake3 = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+croner = { workspace = true }
+ctrlc = { workspace = true, features = ["termination"] }
+directories = { workspace = true }
+file-rotate = { workspace = true }
+flate2 = { workspace = true }
+fs2 = { workspace = true }
+humantime = { workspace = true }
+ignore = { workspace = true }
+notify = { workspace = true }
+percent-encoding = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sysinfo = { workspace = true }
+tar = { workspace = true }
+tempfile = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+walkdir = { workspace = true }
+xattr = { workspace = true }
+zpaq_rs = { workspace = true }
+zstd = { workspace = true }

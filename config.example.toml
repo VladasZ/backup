@@ -1,0 +1,38 @@
+[compression]
+algorithm = "zpaq"
+level = 4
+
+[[backup]]
+name = "documents"
+source = "/home/alice/Documents"
+destinations = [
+  "/mnt/backup/documents",
+  "ssh://backup-box/srv/backups/documents",
+]
+cron = "0 2 * * *"
+retention = { count = 30 }
+exclude = [
+  "*.tmp",
+  ".cache/",
+  "node_modules/",
+]
+
+[[backup]]
+name = "server-config"
+source = "ssh://admin@server.example.com:2222/etc"
+destinations = [
+  "/mnt/backup/server-config",
+  "ssh://backup-box/srv/backups/server-config",
+]
+cron = "30 3 * * *"
+retention = { age = "90d" }
+exclude = [
+  "*.swp",
+  "*.pid",
+]
+
+[[backup]]
+name = "photos"
+source = "/home/alice/Pictures"
+destinations = ["/mnt/archive/photos"]
+cron = "0 4 * * 0"

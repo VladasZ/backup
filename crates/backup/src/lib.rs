@@ -1,0 +1,26 @@
+pub mod agent;
+pub mod app;
+pub mod archive;
+pub mod cli;
+pub mod config;
+pub mod daemon;
+pub mod destination;
+pub mod location;
+pub mod lock;
+pub mod logging;
+pub mod logs;
+pub mod operations;
+pub mod paths;
+pub mod protocol;
+pub mod runner;
+pub mod service;
+pub mod ssh;
+pub mod state;
+pub mod storage;
+pub mod transport;
+
+use anyhow::Result;
+
+pub fn run() -> Result<()> {
+    app::run()
+}
