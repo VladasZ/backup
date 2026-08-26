@@ -54,9 +54,6 @@ jobs:
           mkdir -p "$HOME/source" "$HOME/backups" "$HOME/.config/backup"
           echo hello > "$HOME/source/hello.txt"
           cat > "$HOME/.config/backup/config.toml" <<EOF
-          [compression]
-          algorithm = "zstd"
-
           [[backup]]
           name = "documents"
           source = "$HOME/source"
