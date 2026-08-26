@@ -1,94 +1,119 @@
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
-use std::io::{Write, empty};
-use std::path::{Path, PathBuf};
+use std::fs::File;
+use std::io::{self, Read, Write, empty};
+use std::os::unix::fs::MetadataExt;
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use lz4_flex::frame::FrameEncoder;
 use tar::{Builder, EntryType, Header, HeaderMode};
 
-use super::catalog::{FileKind, FileRecord};
+use super::catalog::{Entry, FileKind};
 
-pub fn write_compressed_tar(output: &Path, source: &Path, records: &[FileRecord]) -> Result<()> {
-    let file = File::create(output).with_context(|| format!("create {}", output.display()))?;
-    let encoder = FrameEncoder::new(file);
-    let encoder = write_tar(encoder, source, records)?;
-    encoder.finish().context("finish LZ4 frame")?.sync_all()?;
-    OpenOptions::new()
-        .read(true)
-        .open(output)?
-        .sync_all()
-        .with_context(|| format!("sync {}", output.display()))?;
-    Ok(())
+pub struct ArchiveWriter<W: Write> {
+    builder: Builder<FrameEncoder<W>>,
+    hard_links: HashMap<(u64, u64), PathBuf>,
 }
 
-fn write_tar<W: Write>(writer: W, source: &Path, records: &[FileRecord]) -> Result<W> {
-    let mut builder = Builder::new(writer);
-    builder.mode(HeaderMode::Complete);
-    builder.follow_symlinks(false);
-    let mut hard_links = HashMap::new();
-    for record in records {
-        append_record(&mut builder, source, record, &mut hard_links)?;
+impl<W: Write> ArchiveWriter<W> {
+    pub fn new(writer: W) -> Self {
+        let mut builder = Builder::new(FrameEncoder::new(writer));
+        builder.mode(HeaderMode::Complete);
+        builder.follow_symlinks(false);
+        Self {
+            builder,
+            hard_links: HashMap::new(),
+        }
     }
-    builder.finish()?;
-    builder.into_inner().context("finish TAR archive")
-}
 
-fn append_record<W: Write>(
-    builder: &mut Builder<W>,
-    source: &Path,
-    record: &FileRecord,
-    hard_links: &mut HashMap<(u64, u64), PathBuf>,
-) -> Result<()> {
-    let path = if source.is_file() {
-        source
-    } else {
-        &record.absolute
-    };
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("read metadata while archiving {}", path.display()))?;
-    append_xattrs(builder, &record.xattrs)?;
-    let mut header = Header::new_gnu();
-    header.set_metadata(&metadata);
-    match record.kind {
-        FileKind::Directory => {
-            header.set_entry_type(EntryType::Directory);
-            header.set_size(0);
-            builder.append_data(&mut header, &record.relative, empty())?;
-        }
-        FileKind::Symlink => {
-            header.set_entry_type(EntryType::Symlink);
-            header.set_size(0);
-            header.set_link_name(
-                record
-                    .link_target
-                    .as_ref()
-                    .context("symlink catalog entry has no target")?,
-            )?;
-            builder.append_data(&mut header, &record.relative, empty())?;
-        }
-        FileKind::File => {
-            let key = (record.device, record.inode);
-            if record.links > 1
-                && let Some(first_path) = hard_links.get(&key)
-            {
-                header.set_entry_type(EntryType::Link);
+    pub fn append(&mut self, entry: &Entry) -> Result<()> {
+        append_xattrs(&mut self.builder, &entry.xattrs)?;
+        let mut header = Header::new_gnu();
+        header.set_metadata(&entry.metadata);
+        match entry.kind {
+            FileKind::Directory => {
+                header.set_entry_type(EntryType::Directory);
                 header.set_size(0);
-                header.set_link_name(first_path)?;
-                builder.append_data(&mut header, &record.relative, empty())?;
-            } else {
-                if record.links > 1 {
-                    hard_links.insert(key, record.relative.clone());
+                self.builder
+                    .append_data(&mut header, &entry.relative, empty())?;
+            }
+            FileKind::Symlink => {
+                header.set_entry_type(EntryType::Symlink);
+                header.set_size(0);
+                header.set_link_name(
+                    entry
+                        .link_target
+                        .as_ref()
+                        .context("symlink catalog entry has no target")?,
+                )?;
+                self.builder
+                    .append_data(&mut header, &entry.relative, empty())?;
+            }
+            FileKind::File => {
+                let key = (entry.metadata.dev(), entry.metadata.ino());
+                if entry.metadata.nlink() > 1
+                    && let Some(first_path) = self.hard_links.get(&key)
+                {
+                    header.set_entry_type(EntryType::Link);
+                    header.set_size(0);
+                    header.set_link_name(first_path)?;
+                    self.builder
+                        .append_data(&mut header, &entry.relative, empty())?;
+                } else {
+                    if entry.metadata.nlink() > 1 {
+                        self.hard_links.insert(key, entry.relative.clone());
+                    }
+                    let file = File::open(&entry.absolute).with_context(|| {
+                        format!("open source file {}", entry.absolute.display())
+                    })?;
+                    let size = entry.metadata.len();
+                    header.set_entry_type(EntryType::Regular);
+                    header.set_size(size);
+                    self.builder.append_data(
+                        &mut header,
+                        &entry.relative,
+                        ExactLength {
+                            file,
+                            remaining: size,
+                        },
+                    )?;
                 }
-                let file = File::open(path)
-                    .with_context(|| format!("open source file {}", path.display()))?;
-                header.set_entry_type(EntryType::Regular);
-                header.set_size(metadata.len());
-                builder.append_data(&mut header, &record.relative, file)?;
             }
         }
+        Ok(())
     }
-    Ok(())
+
+    pub fn finish(mut self) -> Result<W> {
+        self.builder.finish()?;
+        let encoder = self.builder.into_inner().context("finish TAR archive")?;
+        encoder.finish().context("finish LZ4 frame")
+    }
+}
+
+// The tar header already promised exactly this many bytes. A file that shrank after the
+// scan is padded with zeros and a file that grew is cut, so every later header stays aligned.
+struct ExactLength {
+    file: File,
+    remaining: u64,
+}
+
+impl Read for ExactLength {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.remaining == 0 {
+            return Ok(0);
+        }
+        let limit = usize::try_from(self.remaining)
+            .map_or(buffer.len(), |remaining| remaining.min(buffer.len()));
+        let read = self.file.read(&mut buffer[..limit])?;
+        let read = if read == 0 {
+            buffer[..limit].fill(0);
+            limit
+        } else {
+            read
+        };
+        self.remaining -= read as u64;
+        Ok(read)
+    }
 }
 
 fn append_xattrs<W: Write>(

@@ -4,6 +4,7 @@ mod store;
 #[cfg(test)]
 mod tests;
 
+use std::cmp::Reverse;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -15,7 +16,10 @@ use crate::archive::Artifact;
 use crate::config::BackupJob;
 use crate::location::Location;
 
-pub use records::{BackupRetry, CompletedRun, PendingDelivery, StatusLine};
+pub use records::{
+    BackupRetry, CompletedRun, DeliveryResult, DeliveryStatus, HistoryLine, PendingDelivery,
+    StatusLine,
+};
 use records::{DeliveryRecord, RetryRecord, RunRecord};
 use redb::ReadableTable;
 
@@ -43,7 +47,13 @@ impl State {
         })
     }
 
-    pub fn register_run(&mut self, artifact: &Artifact, job: &BackupJob) -> Result<Uuid> {
+    pub fn register_run(
+        &mut self,
+        artifact: &Artifact,
+        job: &BackupJob,
+        staged: bool,
+        results: &[DeliveryResult],
+    ) -> Result<Uuid> {
         let run_id = Uuid::new_v4();
         let record = RunRecord {
             job: job.clone(),
@@ -53,7 +63,8 @@ impl State {
             checksum: artifact.checksum.clone(),
             size: artifact.size,
             created_at: artifact.created_at.timestamp(),
-            complete: false,
+            staged,
+            completed_at: None,
         };
         let now = Utc::now().timestamp();
         let key = run_id.to_string();
@@ -63,11 +74,29 @@ impl State {
                 .insert(key.as_str(), encode(&record)?.as_str())?;
             let mut table = transaction.open_table(DELIVERIES)?;
             for destination in &job.destinations {
-                let delivery = DeliveryRecord {
-                    delivered: false,
-                    attempts: 0,
-                    next_retry: now,
-                    last_error: None,
+                let status = results
+                    .iter()
+                    .find(|result| result.destination == *destination)
+                    .map_or(DeliveryStatus::Pending, |result| result.status.clone());
+                let delivery = match status {
+                    DeliveryStatus::Delivered => DeliveryRecord {
+                        delivered: true,
+                        attempts: 1,
+                        next_retry: now,
+                        last_error: None,
+                    },
+                    DeliveryStatus::Failed(error) => DeliveryRecord {
+                        delivered: false,
+                        attempts: 1,
+                        next_retry: now + retry_delay(0),
+                        last_error: Some(error),
+                    },
+                    DeliveryStatus::Pending => DeliveryRecord {
+                        delivered: false,
+                        attempts: 0,
+                        next_retry: now,
+                        last_error: None,
+                    },
                 };
                 table.insert(
                     (key.as_str(), destination.to_string().as_str()),
@@ -93,6 +122,24 @@ impl State {
 
     pub fn due_deliveries(&self, now: DateTime<Utc>) -> Result<Vec<PendingDelivery>> {
         self.pending(|_, delivery| delivery.next_retry <= now.timestamp())
+    }
+
+    pub fn next_due(&self) -> Result<Option<DateTime<Utc>>> {
+        self.store.read(|transaction| {
+            let mut earliest: Option<i64> = None;
+            for (_, value) in deliveries(transaction)? {
+                let delivery: DeliveryRecord = decode(&value)?;
+                if delivery.delivered {
+                    continue;
+                }
+                earliest = Some(earliest.map_or(delivery.next_retry, |current| {
+                    current.min(delivery.next_retry)
+                }));
+            }
+            earliest
+                .map(|value| timestamp(value, "delivery retry timestamp"))
+                .transpose()
+        })
     }
 
     pub fn deliveries_for_run(&self, run_id: Uuid) -> Result<Vec<PendingDelivery>> {
@@ -196,7 +243,7 @@ impl State {
             let mut ready = Vec::new();
             for (run_id, value) in runs(transaction)? {
                 let record: RunRecord = decode(&value)?;
-                if record.complete {
+                if record.completed_at.is_some() {
                     continue;
                 }
                 let mut outstanding = false;
@@ -217,6 +264,7 @@ impl State {
                     run_id: Uuid::parse_str(&run_id)?,
                     archive: record.archive_path,
                     checksum: record.checksum_path,
+                    staged: record.staged,
                 });
             }
             Ok(ready)
@@ -232,9 +280,64 @@ impl State {
             };
             let mut record: RunRecord = decode(existing.value())?;
             drop(existing);
-            record.complete = true;
+            record.completed_at = Some(Utc::now().timestamp());
             table.insert(key.as_str(), encode(&record)?.as_str())?;
             Ok(())
+        })
+    }
+
+    pub fn purge_completed(&self, before: DateTime<Utc>) -> Result<usize> {
+        let cutoff = before.timestamp();
+        self.store.write(|transaction| {
+            let expired: Vec<String> = {
+                let runs = transaction.open_table(RUNS)?;
+                let mut expired = Vec::new();
+                for entry in runs.iter()? {
+                    let (key, value) = entry?;
+                    let record: RunRecord = decode(value.value())?;
+                    if record
+                        .completed_at
+                        .is_some_and(|completed| completed < cutoff)
+                    {
+                        expired.push(key.value().to_owned());
+                    }
+                }
+                expired
+            };
+            let mut runs = transaction.open_table(RUNS)?;
+            let mut deliveries = transaction.open_table(DELIVERIES)?;
+            for run_id in &expired {
+                runs.remove(run_id.as_str())?;
+                let destinations: Vec<String> = deliveries
+                    .range((run_id.as_str(), "")..(run_id.as_str(), "\u{10FFFF}"))?
+                    .map(|entry| entry.map(|(key, _)| key.value().1.to_owned()))
+                    .collect::<Result<_, _>>()?;
+                for destination in destinations {
+                    deliveries.remove((run_id.as_str(), destination.as_str()))?;
+                }
+            }
+            Ok(expired.len())
+        })
+    }
+
+    pub fn history(&self) -> Result<Vec<HistoryLine>> {
+        self.store.read(|transaction| {
+            let mut lines = Vec::new();
+            for (_, value) in runs(transaction)? {
+                let record: RunRecord = decode(&value)?;
+                let Some(completed) = record.completed_at else {
+                    continue;
+                };
+                lines.push(HistoryLine {
+                    job: record.job.name,
+                    archive: record.archive_name,
+                    size: record.size,
+                    created_at: timestamp(record.created_at, "run timestamp")?,
+                    completed_at: timestamp(completed, "completion timestamp")?,
+                });
+            }
+            lines.sort_by_key(|line| Reverse(line.completed_at));
+            Ok(lines)
         })
     }
 
@@ -306,7 +409,7 @@ impl State {
             let mut lines = Vec::new();
             for (run_id, value) in runs(transaction)? {
                 let record: RunRecord = decode(&value)?;
-                if record.complete {
+                if record.completed_at.is_some() {
                     continue;
                 }
                 let mut pending_destinations = 0usize;

@@ -6,6 +6,36 @@ use anyhow::{Context, Result, bail};
 use blake3::Hasher;
 use uuid::Uuid;
 
+pub struct HashingWriter<W: Write> {
+    pub inner: W,
+    hasher: Hasher,
+}
+
+impl<W: Write> HashingWriter<W> {
+    pub fn new(inner: W) -> Self {
+        Self {
+            inner,
+            hasher: Hasher::new(),
+        }
+    }
+
+    pub fn checksum(&self) -> String {
+        self.hasher.finalize().to_hex().to_string()
+    }
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(bytes)?;
+        self.hasher.update(&bytes[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 pub fn checksum_file(path: &Path) -> Result<String> {
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut reader = BufReader::new(file);

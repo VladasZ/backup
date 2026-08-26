@@ -17,10 +17,13 @@ nothing else to choose.
 - Full TAR archives with UTC timestamps and UUIDs.
 - LZ4 compressed TAR archives, readable by the standard `lz4` tool.
 - Infinite retention by default, with optional count or age retention.
-- Durable staging and destination-specific retries.
+- Streaming delivery to every destination at once, no full local copy needed.
+- Staged copy and destination-specific retries when a destination fails.
 - Atomic publication and BLAKE3 checksum files.
-- Pre/post source catalogs with up to five consistency attempts.
+- Pre/post source catalogs that report files changed during the archive pass.
 - Symbolic links, hard links, metadata, ownership, and extended attributes.
+- Sockets, FIFOs, and device files are skipped with a warning.
+- Thirty days of completed run history.
 - Gitignore-style exclusions configured per job.
 - Automatic configuration reload.
 - Rotating log files.
@@ -138,7 +141,7 @@ Each `[[backup]]` record contains:
 A source may be one regular file or a directory. The source path itself must not
 be a symlink, and a symlink source is rejected at validate and run time.
 Symlinks found inside the source are stored as symlinks as usual. Sockets, device
-files, FIFOs, and other special files fail the archive attempt.
+files, FIFOs, and other special files are skipped and logged.
 
 ### SSH locations
 
@@ -250,8 +253,9 @@ and uses a temporary file to test destination write access.
 backup run documents
 ```
 
-Every destination is attempted. A failed destination leaves the archive in
-staging for retry.
+Every destination is attempted at once. A failed destination leaves the archive
+in staging for retry when a staged copy exists, see below. Commands other than
+`daemon` print their log lines to stderr.
 
 ### Show pending deliveries
 
@@ -261,6 +265,17 @@ backup status
 
 Status lists archives with undelivered destinations. It does not show the
 operating system service status.
+
+### Show completed backups
+
+```sh
+backup history
+backup history documents
+```
+
+History lists runs that finished on every destination during the last 30 days,
+newest first, with the archive size and finish time. Older runs are removed from
+the state database by the daemon once an hour.
 
 ```sh
 launchctl print "gui/$(id -u)/com.vladas.backup" # macOS
@@ -381,6 +396,18 @@ configuration, state, staged data, logs, or destination archives.
 
 ## Archive and delivery behavior
 
+The archive is a single tar.lz4 stream that is written to every destination at
+the same time while it is being created. Nothing is written to the local disk
+for a job with one local destination. When a job has an SSH destination or more
+than one destination, the same stream is also written to staging so a failed
+destination can be retried from a copy. The staged copy is deleted as soon as
+every destination has the archive. Remote sources stream through the controller
+in the same way, so the remote host never stores a full archive either.
+
+A failed destination is kept for retry only when a staged copy exists. With one
+local destination and no staging, a failure fails the run and the daemon retries
+the whole slot.
+
 Names use this form:
 
 ```text
@@ -416,8 +443,8 @@ Successful destinations are not sent the same archive again. A corrupt
 destination copy is replaced from staging, and a bad checksum file is
 repaired after the archive itself is verified.
 
-Staging is deleted only after all destinations finish. Removing a job from the
-configuration does not cancel its recorded pending deliveries.
+Removing a job from the configuration does not cancel its recorded pending
+deliveries.
 
 On startup, complete staged archives not yet recorded in the state database are verified
 and recovered for matching active jobs. Corrupt staged archives are preserved
@@ -425,10 +452,14 @@ and logged for inspection.
 
 ## Consistency and filesystem behavior
 
-Version 1 does not create snapshots. It catalogs source metadata immediately
-before and after writing an archive. If the catalog changes, the partial
-archive is discarded and retried. After five unstable attempts the job fails
-and the error is logged.
+Version 1 does not create snapshots. It catalogs source metadata while writing
+the archive and again right after. If the catalog changed, the archive is still
+published and a warning lists the changed paths, up to twenty of them, with the
+total count. A slightly inconsistent backup is better than none, and the log
+tells you which files to check.
+
+A file that shrinks while it is being read is padded with zeros in the archive
+and a file that grows is cut at its cataloged size, so the archive stays valid.
 
 This catches normal changes to paths, types, sizes, timestamps, ownership,
 links, and extended attributes. It cannot guarantee a perfectly atomic view
@@ -457,12 +488,9 @@ measured as space not available to the service, so space a filesystem reserves
 for root counts as used, and the warning can appear a little earlier than a
 plain disk tool would show.
 
-New archives pause when staging has less free space than the larger of:
-
-- 10 GiB.
-- 5 percent of the staging filesystem.
-
-Already staged deliveries remain recorded for retry.
+There is no free space check before a run. A destination or staging disk that
+fills up fails only that copy, its partial file is removed, and the other
+copies continue.
 
 ## Runtime files
 
@@ -494,9 +522,10 @@ Logs:
   <state directory>/logs/backup.log
 ```
 
-Logs rotate at 10 MiB and keep nine rotated files plus the current file.
-`RUST_LOG` controls the log filter; the default is `info`. The staging path is
-not configurable.
+Logs rotate at 10 MiB and keep nine rotated files plus the current file. Only
+the daemon and the remote agent write to the log file. Other commands log to
+stderr. `RUST_LOG` controls the log filter; the default is `info`. The staging
+path is not configurable.
 
 ## Development
 
@@ -512,7 +541,8 @@ targets on Linux for every push and pull request.
 The integration tests under `crates/backup/tests/` drive the real binary. The
 SSH tests start a container running sshd and exercise every combination of
 local and SSH source and destination, so they need Docker. They print a skip
-line and pass when Docker is not running.
+line and pass when Docker is not running. On macOS the Linux agent binary is
+built in a container and rebuilt whenever a source file is newer than it.
 
 ## Troubleshooting
 
@@ -536,9 +566,10 @@ backup logs --follow
 The archive stays in staging while failed destinations retry. Repair the
 destination or SSH access and leave the daemon running.
 
-### Source consistency fails five times
+### The log warns that the source changed
 
-Move the schedule to a quieter period, pause the writer, or back up an
+The archive was still published. Check the listed paths, and for important
+data move the schedule to a quieter period, pause the writer, or back up an
 application-generated export.
 
 ### A configuration edit does not load

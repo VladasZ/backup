@@ -1,4 +1,4 @@
-use std::io::{Error, Result as IoResult, Write};
+use std::io::{Error, Result as IoResult, Write, stderr};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -63,14 +63,18 @@ impl Write for LogGuard {
     }
 }
 
-pub fn initialize(path: &Path) -> Result<()> {
+pub fn initialize(file: Option<&Path>) -> Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt()
+    let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_ansi(false)
-        .with_target(false)
-        .with_writer(LogWriter::new(path))
-        .finish()
-        .try_init()
-        .context("initialize logging")
+        .with_target(false);
+    match file {
+        Some(path) => builder
+            .with_writer(LogWriter::new(path))
+            .finish()
+            .try_init(),
+        None => builder.with_writer(stderr).finish().try_init(),
+    }
+    .context("initialize logging")
 }

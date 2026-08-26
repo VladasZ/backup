@@ -78,7 +78,7 @@ fn agent_binary() -> PathBuf {
     let root = workspace_root();
     let target = root.join("target/linux-agent");
     let built = target.join("release/backup");
-    if !built.exists() {
+    if !built.exists() || sources_newer_than(&root.join("crates/backup/src"), &built) {
         require(
             "docker",
             &[
@@ -105,6 +105,25 @@ fn agent_binary() -> PathBuf {
         built.display()
     );
     built
+}
+
+fn sources_newer_than(sources: &Path, binary: &Path) -> bool {
+    let built = fs::metadata(binary)
+        .and_then(|metadata| metadata.modified())
+        .expect("agent binary time");
+    let mut pending = vec![sources.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).expect("read source directory") {
+            let entry = entry.expect("read source entry");
+            let metadata = entry.metadata().expect("source entry metadata");
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else if metadata.modified().expect("source time") > built {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 struct RemoteHost {
@@ -428,5 +447,36 @@ fn every_combination_of_local_and_ssh_endpoints_round_trips() {
             .exec("ls /srv/local-ssh/*.tar.lz4 /srv/ssh-ssh/*.tar.lz4 | wc -l")
             .trim(),
         "2"
+    );
+
+    // A destination the agent cannot create. The run must report the agent's own reason,
+    // not the broken pipe the controller sees once the agent has gone away.
+    remote.exec("touch /srv/blocker");
+    write_config(
+        &root,
+        &Case {
+            name: "rejected",
+            source: local_source,
+            destination: remote.uri("/srv/blocker/inside"),
+        },
+    );
+    let output = backup(&root, &["run", "rejected"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "a single failed remote should be staged for retry, not fail the run:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("remote agent error") && stderr.contains("create destination"),
+        "the agent's reason was lost: {stderr}"
+    );
+    assert!(
+        !stderr.to_lowercase().contains("broken pipe"),
+        "broken pipe leaked into the error: {stderr}"
+    );
+    let status = backup_ok(&root, &["status"]);
+    assert!(
+        status.contains("1 destination(s) pending"),
+        "the failed remote delivery was not kept for retry:\n{status}"
     );
 }

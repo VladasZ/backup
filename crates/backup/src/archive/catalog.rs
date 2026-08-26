@@ -1,45 +1,42 @@
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fs::{self, Metadata};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use blake3::Hasher;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
-use serde::{Deserialize, Serialize};
 use sysinfo::Disks;
 use walkdir::WalkDir;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Catalog {
-    pub records: Vec<FileRecord>,
-    pub skipped_mounts: Vec<PathBuf>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct FileRecord {
-    pub absolute: PathBuf,
-    pub relative: PathBuf,
-    pub kind: FileKind,
-    pub size: u64,
-    pub modified_seconds: i64,
-    pub modified_nanoseconds: i64,
-    pub changed_seconds: i64,
-    pub changed_nanoseconds: i64,
-    pub device: u64,
-    pub inode: u64,
-    pub links: u64,
-    pub mode: u32,
-    pub user: u32,
-    pub group: u32,
-    pub link_target: Option<PathBuf>,
-    pub xattrs: Vec<(String, Vec<u8>)>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FileKind {
     Directory,
     File,
     Symlink,
+}
+
+pub struct Entry {
+    pub absolute: PathBuf,
+    pub relative: PathBuf,
+    pub kind: FileKind,
+    pub metadata: Metadata,
+    pub link_target: Option<PathBuf>,
+    pub xattrs: Vec<(String, Vec<u8>)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Fingerprint {
+    pub relative: PathBuf,
+    pub hash: [u8; 32],
+}
+
+#[derive(Debug, Default)]
+pub struct Walk {
+    pub fingerprints: Vec<Fingerprint>,
+    pub skipped_mounts: Vec<PathBuf>,
+    pub skipped_special: Vec<PathBuf>,
 }
 
 pub struct SourceScanner {
@@ -81,28 +78,30 @@ impl SourceScanner {
         })
     }
 
-    pub fn scan(&self) -> Result<Catalog> {
+    pub fn walk(&self, visit: &mut dyn FnMut(&Entry) -> Result<()>) -> Result<Walk> {
+        let mut walk = Walk::default();
         if self.source_is_file {
             let relative = self
                 .source
                 .file_name()
                 .map(PathBuf::from)
                 .context("source file has no name")?;
-            return Ok(Catalog {
-                records: vec![record(&self.source, relative)?],
-                skipped_mounts: Vec::new(),
-            });
+            let metadata = fs::symlink_metadata(&self.source)
+                .with_context(|| format!("read metadata {}", self.source.display()))?;
+            let entry = entry(&self.source, relative, metadata)?
+                .with_context(|| format!("source {} is a special file", self.source.display()))?;
+            walk.fingerprints.push(fingerprint(&entry));
+            visit(&entry)?;
+            return Ok(walk);
         }
 
-        let mut records = Vec::new();
-        let mut skipped_mounts = Vec::new();
         let mut walker = WalkDir::new(&self.source)
             .follow_links(false)
             .sort_by_file_name()
             .into_iter();
-        while let Some(entry) = walker.next() {
-            let entry = entry.with_context(|| format!("walk source {}", self.source.display()))?;
-            let path = entry.path();
+        while let Some(item) = walker.next() {
+            let item = item.with_context(|| format!("walk source {}", self.source.display()))?;
+            let path = item.path();
             if path == self.source {
                 continue;
             }
@@ -113,7 +112,7 @@ impl SourceScanner {
                 if is_directory {
                     walker.skip_current_dir();
                 }
-                skipped_mounts.push(path.to_path_buf());
+                walk.skipped_mounts.push(path.to_path_buf());
                 continue;
             }
             if self
@@ -130,14 +129,18 @@ impl SourceScanner {
                 .strip_prefix(&self.source)
                 .context("walked path escaped source")?
                 .to_path_buf();
-            records.push(record_with_metadata(path, relative, metadata)?);
+            let Some(entry) = entry(path, relative, metadata)? else {
+                walk.skipped_special.push(path.to_path_buf());
+                continue;
+            };
+            walk.fingerprints.push(fingerprint(&entry));
+            visit(&entry)?;
         }
-        records.sort_by(|left, right| left.relative.cmp(&right.relative));
-        skipped_mounts.sort();
-        Ok(Catalog {
-            records,
-            skipped_mounts,
-        })
+        walk.fingerprints
+            .sort_by(|left, right| left.relative.cmp(&right.relative));
+        walk.skipped_mounts.sort();
+        walk.skipped_special.sort();
+        Ok(walk)
     }
 }
 
@@ -150,13 +153,43 @@ pub fn ensure_not_symlink(source: &Path) -> Result<()> {
     Ok(())
 }
 
-fn record(path: &Path, relative: PathBuf) -> Result<FileRecord> {
-    let metadata =
-        fs::symlink_metadata(path).with_context(|| format!("read metadata {}", path.display()))?;
-    record_with_metadata(path, relative, metadata)
+pub fn changed_paths(before: &[Fingerprint], after: &[Fingerprint]) -> Vec<PathBuf> {
+    let mut changed = Vec::new();
+    let mut before = before.iter().peekable();
+    let mut after = after.iter().peekable();
+    loop {
+        match (before.peek(), after.peek()) {
+            (None, None) => return changed,
+            (Some(old), None) => {
+                changed.push(old.relative.clone());
+                before.next();
+            }
+            (None, Some(new)) => {
+                changed.push(new.relative.clone());
+                after.next();
+            }
+            (Some(old), Some(new)) => match old.relative.cmp(&new.relative) {
+                Ordering::Less => {
+                    changed.push(old.relative.clone());
+                    before.next();
+                }
+                Ordering::Greater => {
+                    changed.push(new.relative.clone());
+                    after.next();
+                }
+                Ordering::Equal => {
+                    if old.hash != new.hash {
+                        changed.push(old.relative.clone());
+                    }
+                    before.next();
+                    after.next();
+                }
+            },
+        }
+    }
 }
 
-fn record_with_metadata(path: &Path, relative: PathBuf, metadata: Metadata) -> Result<FileRecord> {
+fn entry(path: &Path, relative: PathBuf, metadata: Metadata) -> Result<Option<Entry>> {
     let file_type = metadata.file_type();
     let kind = if file_type.is_dir() {
         FileKind::Directory
@@ -165,31 +198,60 @@ fn record_with_metadata(path: &Path, relative: PathBuf, metadata: Metadata) -> R
     } else if file_type.is_symlink() {
         FileKind::Symlink
     } else {
-        bail!("unsupported special file {}", path.display());
+        return Ok(None);
     };
     let link_target = if kind == FileKind::Symlink {
         Some(fs::read_link(path).with_context(|| format!("read link {}", path.display()))?)
     } else {
         None
     };
-    Ok(FileRecord {
+    let xattrs = read_xattrs(path)?;
+    Ok(Some(Entry {
         absolute: path.to_path_buf(),
         relative,
         kind,
-        size: metadata.len(),
-        modified_seconds: metadata.mtime(),
-        modified_nanoseconds: metadata.mtime_nsec(),
-        changed_seconds: metadata.ctime(),
-        changed_nanoseconds: metadata.ctime_nsec(),
-        device: metadata.dev(),
-        inode: metadata.ino(),
-        links: metadata.nlink(),
-        mode: metadata.mode(),
-        user: metadata.uid(),
-        group: metadata.gid(),
+        metadata,
         link_target,
-        xattrs: read_xattrs(path)?,
-    })
+        xattrs,
+    }))
+}
+
+fn fingerprint(entry: &Entry) -> Fingerprint {
+    let metadata = &entry.metadata;
+    let mut hasher = Hasher::new();
+    hasher.update(&[entry.kind as u8]);
+    for value in [
+        metadata.len(),
+        metadata.dev(),
+        metadata.ino(),
+        metadata.nlink(),
+    ] {
+        hasher.update(&value.to_le_bytes());
+    }
+    for value in [
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    ] {
+        hasher.update(&value.to_le_bytes());
+    }
+    for value in [metadata.mode(), metadata.uid(), metadata.gid()] {
+        hasher.update(&value.to_le_bytes());
+    }
+    if let Some(target) = &entry.link_target {
+        hasher.update(target.as_os_str().as_encoded_bytes());
+    }
+    for (name, value) in &entry.xattrs {
+        hasher.update(&(name.len() as u64).to_le_bytes());
+        hasher.update(name.as_bytes());
+        hasher.update(&(value.len() as u64).to_le_bytes());
+        hasher.update(value);
+    }
+    Fingerprint {
+        relative: entry.relative.clone(),
+        hash: *hasher.finalize().as_bytes(),
+    }
 }
 
 fn read_xattrs(path: &Path) -> Result<Vec<(String, Vec<u8>)>> {
@@ -247,10 +309,12 @@ fn decode_mount_field(value: &str) -> String {
 mod tests {
     use std::fs;
     use std::os::unix::fs::symlink;
+    use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
 
     use tempfile::tempdir;
 
-    use super::SourceScanner;
+    use super::{Fingerprint, SourceScanner, changed_paths};
 
     #[test]
     fn rejects_a_symlink_source() {
@@ -262,5 +326,47 @@ mod tests {
 
         assert!(SourceScanner::new(&link, &[]).is_err());
         assert!(SourceScanner::new(&real, &[]).is_ok());
+    }
+
+    #[test]
+    fn special_files_are_skipped_not_fatal() {
+        let temporary = tempdir().unwrap();
+        let source = temporary.path().join("s");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("keep.txt"), "keep").unwrap();
+        let socket = UnixListener::bind(source.join("agent.sock")).unwrap();
+
+        let scanner = SourceScanner::new(&source, &[]).unwrap();
+        let mut seen = Vec::new();
+        let walk = scanner
+            .walk(&mut |entry| {
+                seen.push(entry.relative.clone());
+                Ok(())
+            })
+            .unwrap();
+        drop(socket);
+
+        assert_eq!(seen, vec![PathBuf::from("keep.txt")]);
+        assert_eq!(
+            walk.skipped_special,
+            vec![fs::canonicalize(&source).unwrap().join("agent.sock")]
+        );
+        assert_eq!(walk.fingerprints.len(), 1);
+    }
+
+    #[test]
+    fn changed_paths_reports_added_removed_and_modified_entries() {
+        let print = |name: &str, hash: u8| Fingerprint {
+            relative: PathBuf::from(name),
+            hash: [hash; 32],
+        };
+        let before = [print("a", 1), print("b", 1), print("d", 1)];
+        let after = [print("a", 1), print("b", 2), print("c", 1)];
+
+        assert_eq!(
+            changed_paths(&before, &after),
+            vec![PathBuf::from("b"), PathBuf::from("c"), PathBuf::from("d")]
+        );
+        assert!(changed_paths(&before, &before).is_empty());
     }
 }

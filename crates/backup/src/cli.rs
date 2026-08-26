@@ -50,6 +50,9 @@ pub enum Command {
     Prune {
         job: Option<String>,
     },
+    History {
+        job: Option<String>,
+    },
     Install,
     Uninstall,
     #[command(hide = true)]

@@ -17,7 +17,11 @@ pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let paths = AppPaths::discover(cli.config)?;
     paths.ensure()?;
-    logging::initialize(&paths.log_file)?;
+    let log_file = match cli.command {
+        Command::Daemon | Command::Agent => Some(paths.log_file.as_path()),
+        _ => None,
+    };
+    logging::initialize(log_file)?;
     match cli.command {
         Command::Agent => agent::run(&paths),
         Command::Validate => {
@@ -70,6 +74,10 @@ pub fn run() -> Result<()> {
             let result = operations::prune(&config, job.as_deref());
             drop(operation_lock);
             result
+        }
+        Command::History { job } => {
+            let runner = Runner::new(Config::load(&paths.config)?, paths)?;
+            runner.print_history(job.as_deref())
         }
         Command::Install => {
             let config = Config::load(&paths.config)?;

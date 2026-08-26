@@ -4,7 +4,7 @@ use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Timelike, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Timelike, Utc};
 use notify::{Event, RecursiveMode, Result as NotifyResult, Watcher, recommended_watcher};
 use tracing::{error, info, warn};
 
@@ -15,6 +15,8 @@ use crate::runner::Runner;
 use crate::state::BackupRetry;
 
 const LOOP_INTERVAL: Duration = Duration::from_secs(1);
+const DELIVERY_RECHECK_SECONDS: i64 = 60;
+const PURGE_INTERVAL_HOURS: i64 = 1;
 
 pub fn run(config: Config, paths: AppPaths) -> Result<()> {
     let daemon_lock = AppLock::try_exclusive(
@@ -39,14 +41,28 @@ pub fn run(config: Config, paths: AppPaths) -> Result<()> {
     let mut runner = Runner::new(config, paths)?;
     runner.recover_staging()?;
     info!(config = %runner.paths.config.display(), "backup daemon started");
+    let mut next_delivery_check = Utc::now();
+    let mut last_purge: Option<DateTime<Utc>> = None;
     while !stopping.load(Ordering::SeqCst) {
-        if let Err(error) = runner.process_due_deliveries_until(Some(&stopping)) {
-            error!(%error, "failed to process pending deliveries");
+        let now = Utc::now();
+        if last_purge.is_none_or(|last| now - last >= ChronoDuration::hours(PURGE_INTERVAL_HOURS)) {
+            if let Err(error) = runner.purge_history() {
+                error!(%error, "failed to purge old history");
+            }
+            last_purge = Some(now);
+        }
+        if next_delivery_check <= now {
+            if let Err(error) = runner.process_due_deliveries_until(Some(&stopping)) {
+                error!(%error, "failed to process pending deliveries");
+            }
+            next_delivery_check = next_check(&runner)?;
         }
         if stopping.load(Ordering::SeqCst) {
             break;
         }
-        run_due_jobs(&mut runner, &stopping)?;
+        if run_due_jobs(&mut runner, &stopping)? {
+            next_delivery_check = next_check(&runner)?;
+        }
 
         match receiver.recv_timeout(LOOP_INTERVAL) {
             Ok(event) => {
@@ -71,8 +87,19 @@ pub fn run(config: Config, paths: AppPaths) -> Result<()> {
     Ok(())
 }
 
-fn run_due_jobs(runner: &mut Runner, stopping: &AtomicBool) -> Result<()> {
+// Other processes such as `backup run` can add pending deliveries at any time, so an idle
+// daemon still looks again after a minute even when its own state showed nothing due.
+fn next_check(runner: &Runner) -> Result<DateTime<Utc>> {
+    let fallback = Utc::now() + ChronoDuration::seconds(DELIVERY_RECHECK_SECONDS);
+    Ok(runner
+        .state
+        .next_due()?
+        .map_or(fallback, |due| due.min(fallback)))
+}
+
+fn run_due_jobs(runner: &mut Runner, stopping: &AtomicBool) -> Result<bool> {
     let now = Utc::now();
+    let mut ran = false;
     let jobs = runner.config.jobs.clone();
     for job in jobs {
         if stopping.load(Ordering::SeqCst) {
@@ -86,6 +113,7 @@ fn run_due_jobs(runner: &mut Runner, stopping: &AtomicBool) -> Result<()> {
         };
 
         info!(job = job.name, scheduled_at = %slot, "queueing scheduled backup");
+        ran = true;
         match runner.run_job(&job) {
             Ok(()) => {
                 runner.state.set_last_scheduled(&job.name, slot)?;
@@ -103,7 +131,7 @@ fn run_due_jobs(runner: &mut Runner, stopping: &AtomicBool) -> Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(ran)
 }
 
 fn due_backup(

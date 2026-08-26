@@ -1,14 +1,92 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use tracing::{info, warn};
 
-use crate::archive::{Artifact, read_checksum, verify_checksum, write_checksum};
+use crate::archive::{Artifact, Sink, SinkId, read_checksum, verify_checksum, write_checksum};
 use crate::config::{BackupJob, RetentionConfig};
+use crate::location::Location;
 use crate::storage::warn_if_high;
+
+pub struct LocalSink {
+    destination: PathBuf,
+    partial: PathBuf,
+    target: PathBuf,
+    file: File,
+    job: BackupJob,
+}
+
+impl LocalSink {
+    pub fn open(destination: &Path, name: &str, job: &BackupJob) -> Result<Box<dyn Sink>> {
+        fs::create_dir_all(destination)
+            .with_context(|| format!("create destination {}", destination.display()))?;
+        warn_if_high(destination, "destination")?;
+        let partial = destination.join(format!(".{name}.partial"));
+        remove_if_present(&partial)?;
+        let file =
+            File::create(&partial).with_context(|| format!("create {}", partial.display()))?;
+        Ok(Box::new(Self {
+            destination: destination.to_path_buf(),
+            partial,
+            target: destination.join(name),
+            file,
+            job: job.clone(),
+        }))
+    }
+}
+
+impl Sink for LocalSink {
+    fn id(&self) -> SinkId {
+        SinkId::Destination(Location::Local(self.destination.clone()))
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.file.write_all(bytes)
+    }
+
+    fn finish(self: Box<Self>, checksum: &str, _size: u64) -> Result<()> {
+        let result = (|| {
+            self.file.sync_all()?;
+            verify_checksum(&self.partial, checksum)?;
+            publish(&self.partial, &self.target, checksum)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            remove_if_present(&self.partial)?;
+            return result;
+        }
+        info!(
+            job = self.job.name,
+            destination = %self.destination.display(),
+            archive = %self.target.display(),
+            "delivered archive"
+        );
+        prune_best_effort(&self.destination, &self.job);
+        Ok(())
+    }
+
+    fn abort(self: Box<Self>) -> Option<String> {
+        drop(self.file);
+        if let Err(error) = remove_if_present(&self.partial) {
+            warn!(%error, "could not remove partial destination archive");
+        }
+        None
+    }
+}
+
+fn publish(partial: &Path, target: &Path, checksum: &str) -> Result<()> {
+    fs::rename(partial, target)
+        .with_context(|| format!("publish destination archive {}", target.display()))?;
+    write_checksum(target, checksum)?;
+    let directory = target
+        .parent()
+        .context("destination archive has no parent directory")?;
+    File::open(directory)?.sync_all()?;
+    Ok(())
+}
 
 #[derive(Clone, Debug)]
 pub struct ArchiveInfo {
@@ -59,10 +137,7 @@ pub fn deliver_local(artifact: &Artifact, destination: &Path, job: &BackupJob) -
     })?;
     OpenOptions::new().read(true).open(&partial)?.sync_all()?;
     verify_checksum(&partial, &artifact.checksum)?;
-    fs::rename(&partial, &target)
-        .with_context(|| format!("publish destination archive {}", target.display()))?;
-    write_checksum(&target, &artifact.checksum)?;
-    File::open(destination)?.sync_all()?;
+    publish(&partial, &target, &artifact.checksum)?;
     info!(
         job = job.name,
         destination = %destination.display(),

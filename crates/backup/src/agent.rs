@@ -1,26 +1,27 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, ErrorKind, Read, Write, copy, sink, stdin, stdout};
+use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write, copy, stdin, stdout};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use chrono::Utc;
 use serde::Serialize;
 use serde_json::{Value, from_str, to_value, to_writer};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::archive::{
-    Artifact, create_local_archive, ensure_not_symlink, restore_archive, verify_archive,
-    verify_checksum, write_checksum,
+    Artifact, HashingWriter, Sink, SinkId, SourceScanner, Tee, archive_name, ensure_not_symlink,
+    pump_local, restore_archive, verify_archive, verify_checksum, write_checksum,
 };
 use crate::config::BackupJob;
-use crate::destination::{apply_retention, list_local};
+use crate::destination::{apply_retention, belongs_to_job, list_local};
 use crate::location::Location;
 use crate::paths::AppPaths;
 use crate::protocol::{
-    AgentRequest, PROTOCOL_VERSION, PingResponse, RESPONSE_PREFIX, ResponseEnvelope,
-    WireArchiveInfo, WireArtifact,
+    AgentRequest, PROTOCOL_VERSION, PingResponse, RESPONSE_PREFIX, ResponseEnvelope, StreamHeader,
+    StreamTrailer, WireArchiveInfo, WireArtifact, copy_frames, write_end_frame, write_frame,
 };
-use crate::storage::{require_staging_reserve, warn_if_high};
+use crate::storage::warn_if_high;
 
 pub fn run(paths: &AppPaths) -> Result<()> {
     paths.ensure()?;
@@ -65,12 +66,12 @@ fn handle(request: AgentRequest, reader: &mut dyn BufRead, paths: &AppPaths) -> 
             job,
             source,
             exclude,
-        } => create_and_stream(job, source, exclude, paths),
+        } => create_and_stream(job, source, exclude),
         AgentRequest::Receive {
-            artifact,
+            name,
             destination,
             job,
-        } => receive_archive(reader, &artifact, &destination, &job),
+        } => receive_stream(reader, &name, &destination, &job),
         AgentRequest::List { destination, job } => {
             let archives = list_local(&destination, &job)?
                 .into_iter()
@@ -124,31 +125,59 @@ fn validate_destination_path(path: &Path) -> Result<()> {
     fs::remove_file(&probe).with_context(|| format!("remove write probe {}", probe.display()))
 }
 
-fn create_and_stream(
-    name: String,
-    source: PathBuf,
-    exclude: Vec<String>,
-    paths: &AppPaths,
-) -> Result<()> {
-    require_staging_reserve(&paths.staging)?;
+struct FrameSink;
+
+impl Sink for FrameSink {
+    fn id(&self) -> SinkId {
+        SinkId::Stream
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        write_frame(&mut stdout().lock(), bytes)
+    }
+
+    fn finish(self: Box<Self>, _checksum: &str, _size: u64) -> Result<()> {
+        let mut output = stdout().lock();
+        write_end_frame(&mut output)?;
+        output.flush()?;
+        Ok(())
+    }
+
+    fn abort(self: Box<Self>) -> Option<String> {
+        let mut output = stdout().lock();
+        if let Err(error) = write_end_frame(&mut output).and_then(|()| output.flush()) {
+            warn!(%error, "could not close the archive stream");
+        }
+        None
+    }
+}
+
+fn create_and_stream(name: String, source: PathBuf, exclude: Vec<String>) -> Result<()> {
     warn_if_high(&source, "source")?;
+    let scanner = SourceScanner::new(&source, &exclude)?;
+    let created_at = Utc::now();
+    let archive = archive_name(&name, created_at);
     let job = BackupJob {
         name,
-        source: Location::Local(source.clone()),
-        destinations: vec![Location::Local(paths.staging.clone())],
+        source: Location::Local(source),
+        destinations: vec![Location::Local(PathBuf::from("/"))],
         cron: "0 0 * * *".to_owned(),
         retention: None,
         exclude,
     };
-    let artifact = create_local_archive(&job, &source, &paths.job_staging(&job.name))?;
-    // Open the archive, then unlink both files at once. On Unix the open handle keeps the data
-    // readable while we stream it, and the disk space is freed the moment this process ends, even
-    // if ssh is killed mid-stream. So an interrupted transfer never leaks into remote staging.
-    let file =
-        File::open(&artifact.path).with_context(|| format!("open {}", artifact.path.display()))?;
-    remove_if_present(&artifact.path)?;
-    remove_if_present(&artifact.checksum_path)?;
-    stream_open_archive(file, &WireArtifact::from_artifact(&artifact))
+    write_success(&StreamHeader {
+        name: archive,
+        created_at,
+    })?;
+    let outcome = pump_local(&job, &scanner, Tee::new(vec![Box::new(FrameSink)]))?;
+    if let Some(failed) = outcome.sinks.iter().find(|sink| sink.error.is_some()) {
+        bail!("{failed}");
+    }
+    write_success(&StreamTrailer {
+        checksum: outcome.checksum,
+        size: outcome.size,
+        changed: outcome.changed,
+    })
 }
 
 fn stream_existing(archive: &Path, checksum: &str) -> Result<()> {
@@ -167,16 +196,9 @@ fn stream_existing(archive: &Path, checksum: &str) -> Result<()> {
         size: metadata.len(),
         created_at: metadata.modified()?.into(),
     };
-    stream_artifact(&artifact)
-}
-
-fn stream_artifact(artifact: &Artifact) -> Result<()> {
-    let file = File::open(&artifact.path)?;
-    stream_open_archive(file, &WireArtifact::from_artifact(artifact))
-}
-
-fn stream_open_archive(mut file: File, wire: &WireArtifact) -> Result<()> {
-    write_success(wire)?;
+    let mut file = File::open(&artifact.path)?;
+    let wire = WireArtifact::from_artifact(&artifact);
+    write_success(&wire)?;
     let mut output = stdout().lock();
     let copied = copy(&mut file, &mut output)?;
     if copied != wire.size {
@@ -189,42 +211,56 @@ fn stream_open_archive(mut file: File, wire: &WireArtifact) -> Result<()> {
     Ok(())
 }
 
-fn receive_archive(
+fn receive_stream(
     reader: &mut dyn BufRead,
-    artifact: &WireArtifact,
+    name: &str,
     destination: &Path,
     job: &BackupJob,
 ) -> Result<()> {
+    if !belongs_to_job(name, &job.name) {
+        bail!(
+            "archive name {name:?} does not belong to job {:?}",
+            job.name
+        );
+    }
     fs::create_dir_all(destination)
         .with_context(|| format!("create destination {}", destination.display()))?;
     warn_if_high(destination, "destination")?;
-    let target = destination.join(&artifact.name);
-    if target.exists() {
-        match verify_checksum(&target, &artifact.checksum) {
-            Ok(()) => {
-                let copied = copy(&mut reader.take(artifact.size), &mut sink())?;
-                if copied != artifact.size {
-                    bail!("received {copied} bytes, expected {}", artifact.size);
-                }
-            }
-            Err(error) => {
-                warn!(
-                    path = %target.display(),
-                    %error,
-                    "replacing corrupt destination archive"
-                );
-                let partial =
-                    destination.join(format!(".{}-{}.partial", artifact.name, Uuid::new_v4()));
-                receive_to_path(reader, artifact, &partial)?;
-                fs::rename(&partial, &target)?;
-            }
+    let partial = destination.join(format!(".{name}-{}.partial", Uuid::new_v4()));
+    let received = (|| {
+        let file =
+            File::create(&partial).with_context(|| format!("create {}", partial.display()))?;
+        let mut writer = HashingWriter::new(file);
+        let size = copy_frames(reader, &mut writer)?;
+        writer.inner.sync_all()?;
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        let trailer: StreamTrailer = from_str(&line).context("parse stream trailer")?;
+        let checksum = writer.checksum();
+        if trailer.checksum != checksum || trailer.size != size {
+            bail!(
+                "received {size} bytes {checksum}, expected {} bytes {}",
+                trailer.size,
+                trailer.checksum
+            );
         }
+        Ok(checksum)
+    })();
+    let checksum = match received {
+        Ok(checksum) => checksum,
+        Err(error) => {
+            remove_if_present(&partial)?;
+            return Err(error);
+        }
+    };
+    let target = destination.join(name);
+    if target.exists() && verify_checksum(&target, &checksum).is_ok() {
+        info!(path = %target.display(), "destination already holds this archive");
+        remove_if_present(&partial)?;
     } else {
-        let partial = destination.join(format!(".{}-{}.partial", artifact.name, Uuid::new_v4()));
-        receive_to_path(reader, artifact, &partial)?;
         fs::rename(&partial, &target)?;
     }
-    write_checksum(&target, &artifact.checksum)?;
+    write_checksum(&target, &checksum)?;
     File::open(destination)?.sync_all()?;
     apply_retention(destination, job)?;
     write_success(&Value::Null)

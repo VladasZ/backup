@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use chrono::{Duration, Timelike, Utc};
 use tempfile::tempdir;
 
-use super::State;
+use super::{DeliveryResult, DeliveryStatus, State};
 use crate::archive::Artifact;
 use crate::config::BackupJob;
 use crate::location::Location;
@@ -30,9 +30,10 @@ fn tracks_each_destination_and_completes_only_after_all_deliveries() {
         size: 12,
         created_at: Utc::now(),
     };
-    let run_id = state.register_run(&artifact, &job).unwrap();
+    let run_id = state.register_run(&artifact, &job, true, &[]).unwrap();
     let due = state.due_deliveries(Utc::now()).unwrap();
     assert_eq!(due.len(), 2);
+    assert!(state.next_due().unwrap().is_some());
 
     state.mark_delivered(run_id, &first).unwrap();
     assert!(state.complete_ready_runs().unwrap().is_empty());
@@ -56,6 +57,105 @@ fn tracks_each_destination_and_completes_only_after_all_deliveries() {
     assert_eq!(ready[0].run_id, run_id);
     state.mark_run_complete(run_id).unwrap();
     assert!(state.status().unwrap().is_empty());
+    assert!(state.next_due().unwrap().is_none());
+}
+
+#[test]
+fn registered_results_skip_delivered_destinations_and_retry_failed_ones() {
+    let temporary = tempdir().unwrap();
+    let mut state = State::open(&temporary.path().join("state.redb")).unwrap();
+    let first = Location::Local(PathBuf::from("/first"));
+    let second = Location::Local(PathBuf::from("/second"));
+    let job = BackupJob {
+        name: "documents".to_owned(),
+        source: Location::Local(PathBuf::from("/source")),
+        destinations: vec![first.clone(), second.clone()],
+        cron: "0 2 * * *".to_owned(),
+        retention: None,
+        exclude: Vec::new(),
+    };
+    let artifact = Artifact {
+        name: "documents-archive.tar".to_owned(),
+        path: temporary.path().join("archive.tar"),
+        checksum_path: temporary.path().join("archive.tar.blake3"),
+        checksum: "abc".to_owned(),
+        size: 12,
+        created_at: Utc::now(),
+    };
+    let results = [
+        DeliveryResult {
+            destination: first,
+            status: DeliveryStatus::Delivered,
+        },
+        DeliveryResult {
+            destination: second.clone(),
+            status: DeliveryStatus::Failed("offline".to_owned()),
+        },
+    ];
+
+    state.register_run(&artifact, &job, true, &results).unwrap();
+
+    assert!(state.due_deliveries(Utc::now()).unwrap().is_empty());
+    let later = Utc::now() + Duration::seconds(61);
+    let due = state.due_deliveries(later).unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].destination, second);
+    assert_eq!(due[0].attempts, 1);
+    assert_eq!(state.status().unwrap()[0].pending_destinations, 1);
+}
+
+#[test]
+fn completed_runs_show_in_history_until_purged() {
+    let temporary = tempdir().unwrap();
+    let mut state = State::open(&temporary.path().join("state.redb")).unwrap();
+    let destination = Location::Local(PathBuf::from("/first"));
+    let job = BackupJob {
+        name: "documents".to_owned(),
+        source: Location::Local(PathBuf::from("/source")),
+        destinations: vec![destination.clone()],
+        cron: "0 2 * * *".to_owned(),
+        retention: None,
+        exclude: Vec::new(),
+    };
+    let artifact = Artifact {
+        name: "documents-archive.tar".to_owned(),
+        path: temporary.path().join("archive.tar"),
+        checksum_path: temporary.path().join("archive.tar.blake3"),
+        checksum: "abc".to_owned(),
+        size: 12,
+        created_at: Utc::now(),
+    };
+    let results = [DeliveryResult {
+        destination,
+        status: DeliveryStatus::Delivered,
+    }];
+    state
+        .register_run(&artifact, &job, false, &results)
+        .unwrap();
+    let ready = state.complete_ready_runs().unwrap();
+    assert_eq!(ready.len(), 1);
+    assert!(!ready[0].staged);
+    state.mark_run_complete(ready[0].run_id).unwrap();
+
+    let history = state.history().unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].archive, "documents-archive.tar");
+    assert!(state.status().unwrap().is_empty());
+
+    assert_eq!(
+        state
+            .purge_completed(Utc::now() - Duration::hours(1))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        state
+            .purge_completed(Utc::now() + Duration::seconds(1))
+            .unwrap(),
+        1
+    );
+    assert!(state.history().unwrap().is_empty());
+    assert!(state.due_deliveries(Utc::now()).unwrap().is_empty());
 }
 
 #[test]

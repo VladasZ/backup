@@ -17,7 +17,8 @@ pub struct RunRecord {
     pub checksum: String,
     pub size: u64,
     pub created_at: i64,
-    pub complete: bool,
+    pub staged: bool,
+    pub completed_at: Option<i64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -35,6 +36,19 @@ pub struct RetryRecord {
     pub next_retry: i64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DeliveryStatus {
+    Delivered,
+    Failed(String),
+    Pending,
+}
+
+#[derive(Clone, Debug)]
+pub struct DeliveryResult {
+    pub destination: Location,
+    pub status: DeliveryStatus,
+}
+
 #[derive(Clone, Debug)]
 pub struct PendingDelivery {
     pub run_id: Uuid,
@@ -49,6 +63,7 @@ pub struct CompletedRun {
     pub run_id: Uuid,
     pub archive: PathBuf,
     pub checksum: PathBuf,
+    pub staged: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -57,6 +72,15 @@ pub struct StatusLine {
     pub archive: String,
     pub created_at: DateTime<Utc>,
     pub pending_destinations: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct HistoryLine {
+    pub job: String,
+    pub archive: String,
+    pub size: u64,
+    pub created_at: DateTime<Utc>,
+    pub completed_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Copy, Debug)]
