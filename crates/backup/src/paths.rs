@@ -36,7 +36,7 @@ impl AppPaths {
         let log_directory = state.join("logs");
         Ok(Self {
             config,
-            database: state.join("state.sqlite3"),
+            database: state.join("state.redb"),
             daemon_lock: state.join("daemon.lock"),
             operation_lock: state.join("operation.lock"),
             staging: state.join("staging"),

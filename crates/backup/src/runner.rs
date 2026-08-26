@@ -12,7 +12,7 @@ use crate::archive::{
     write_checksum,
 };
 use crate::config::{BackupJob, Config};
-use crate::destination::{checksum_path, is_archive_name};
+use crate::destination::{belongs_to_job, checksum_path};
 use crate::location::Location;
 use crate::lock::AppLock;
 use crate::paths::AppPaths;
@@ -68,11 +68,9 @@ impl Runner {
         let artifact = match &job.source {
             Location::Local(source) => {
                 warn_if_high(source, "source")?;
-                create_local_archive(job, &self.config.compression, source, &staging)?
+                create_local_archive(job, source, &staging)?
             }
-            Location::Ssh(remote) => {
-                create_remote_archive(job, &self.config.compression, remote, &staging)?
-            }
+            Location::Ssh(remote) => create_remote_archive(job, remote, &staging)?,
         };
         let run_id = self.state.register_run(&artifact, job)?;
         for pending in self.state.deliveries_for_run(run_id)? {
@@ -141,7 +139,6 @@ impl Runner {
         if !directory.exists() {
             return Ok(());
         }
-        let prefix = format!("{}-", job.name);
         for entry in fs::read_dir(&directory)? {
             let entry = entry?;
             let path = entry.path();
@@ -149,7 +146,7 @@ impl Runner {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
-            if !name.starts_with(&prefix) || !is_archive_name(&name) {
+            if !belongs_to_job(&name, &job.name) {
                 continue;
             }
             let artifact = match recovered_artifact(path, name) {
@@ -242,7 +239,7 @@ mod tests {
 
     use super::Runner;
     use crate::archive::{restore_archive, verify_archive};
-    use crate::config::{BackupJob, CompressionAlgorithm, CompressionConfig, Config};
+    use crate::config::{BackupJob, Config};
     use crate::destination::list_local;
     use crate::location::Location;
     use crate::paths::AppPaths;
@@ -265,7 +262,7 @@ mod tests {
         fs::write(source.join("ignored.tmp"), "ignore").unwrap();
         let paths = AppPaths {
             config: temporary.path().join("config.toml"),
-            database: state.join("state.sqlite3"),
+            database: state.join("state.redb"),
             daemon_lock: state.join("daemon.lock"),
             operation_lock: state.join("operation.lock"),
             staging: state.join("staging"),
@@ -274,10 +271,6 @@ mod tests {
             state,
         };
         let config = Config {
-            compression: CompressionConfig {
-                algorithm: CompressionAlgorithm::None,
-                level: None,
-            },
             jobs: vec![BackupJob {
                 name: "documents".to_owned(),
                 source: Location::Local(source),

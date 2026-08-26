@@ -423,7 +423,7 @@ mod tests {
 
     use super::restore;
     use crate::archive::create_local_archive;
-    use crate::config::{BackupJob, CompressionAlgorithm, CompressionConfig};
+    use crate::config::BackupJob;
     use crate::destination::deliver_local;
     use crate::location::Location;
     use crate::paths::AppPaths;
@@ -438,10 +438,6 @@ mod tests {
         let target = temporary.path().join("restored");
         fs::create_dir_all(&source).unwrap();
         fs::write(source.join("file.txt"), "healthy").unwrap();
-        let compression = CompressionConfig {
-            algorithm: CompressionAlgorithm::None,
-            level: None,
-        };
         let job = BackupJob {
             name: "documents".to_owned(),
             source: Location::Local(source.clone()),
@@ -453,14 +449,14 @@ mod tests {
             retention: None,
             exclude: Vec::new(),
         };
-        let artifact = create_local_archive(&job, &compression, &source, &staging).unwrap();
+        let artifact = create_local_archive(&job, &source, &staging).unwrap();
         deliver_local(&artifact, &first, &job).unwrap();
         deliver_local(&artifact, &second, &job).unwrap();
         fs::write(first.join(&artifact.name), "corrupt").unwrap();
         let state = temporary.path().join("state");
         let paths = AppPaths {
             config: temporary.path().join("config.toml"),
-            database: state.join("state.sqlite3"),
+            database: state.join("state.redb"),
             daemon_lock: state.join("daemon.lock"),
             operation_lock: state.join("operation.lock"),
             staging: state.join("staging"),

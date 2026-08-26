@@ -1,71 +1,25 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Write, empty};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::thread;
 
-use anyhow::{Context, Error, Result, anyhow};
-use flate2::Compression;
-use flate2::write::GzEncoder;
+use anyhow::{Context, Result};
+use lz4_flex::frame::FrameEncoder;
 use tar::{Builder, EntryType, Header, HeaderMode};
-use zpaq_rs::compress_stream;
-use zstd::stream::write::Encoder as ZstdEncoder;
-
-use crate::config::{CompressionAlgorithm, CompressionConfig};
 
 use super::catalog::{FileKind, FileRecord};
 
-pub fn write_compressed_tar(
-    output: &Path,
-    source: &Path,
-    records: &[FileRecord],
-    compression: &CompressionConfig,
-) -> Result<()> {
+pub fn write_compressed_tar(output: &Path, source: &Path, records: &[FileRecord]) -> Result<()> {
     let file = File::create(output).with_context(|| format!("create {}", output.display()))?;
-    match compression.algorithm {
-        CompressionAlgorithm::None => {
-            let file = write_tar(file, source, records)?;
-            file.sync_all()?;
-        }
-        CompressionAlgorithm::Gzip => {
-            let encoder = GzEncoder::new(file, Compression::default());
-            let encoder = write_tar(encoder, source, records)?;
-            encoder.finish()?.sync_all()?;
-        }
-        CompressionAlgorithm::Zstd => {
-            let encoder = ZstdEncoder::new(file, 0)?;
-            let encoder = write_tar(encoder, source, records)?;
-            encoder.finish()?.sync_all()?;
-        }
-        CompressionAlgorithm::Zpaq => {
-            let level = compression
-                .level
-                .context("validated ZPAQ level is missing")?;
-            write_zpaq(file, source, records, level)?;
-        }
-    }
+    let encoder = FrameEncoder::new(file);
+    let encoder = write_tar(encoder, source, records)?;
+    encoder.finish().context("finish LZ4 frame")?.sync_all()?;
     OpenOptions::new()
         .read(true)
         .open(output)?
         .sync_all()
         .with_context(|| format!("sync {}", output.display()))?;
     Ok(())
-}
-
-fn write_zpaq(file: File, source: &Path, records: &[FileRecord], level: u8) -> Result<()> {
-    let (reader, writer) = UnixStream::pair().context("create ZPAQ compression pipe")?;
-    let method = level.to_string();
-    let compressor = thread::spawn(move || {
-        compress_stream(reader, file, &method, Some("archive.tar"), None)
-            .map_err(|error| error.to_string())
-    });
-    let tar_result = write_tar(writer, source, records).map(drop);
-    let compression_result = compressor
-        .join()
-        .map_err(|_| anyhow!("ZPAQ compressor thread panicked"))?;
-    tar_result?;
-    compression_result.map_err(Error::msg)
 }
 
 fn write_tar<W: Write>(writer: W, source: &Path, records: &[FileRecord]) -> Result<W> {

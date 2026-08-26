@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::archive::Artifact;
-use crate::config::{BackupJob, CompressionConfig};
+use crate::config::BackupJob;
 
 pub const RESPONSE_PREFIX: &str = "BACKUP/1 ";
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -24,7 +24,6 @@ pub enum AgentRequest {
         job: String,
         source: PathBuf,
         exclude: Vec<String>,
-        compression: CompressionConfig,
     },
     Receive {
         artifact: WireArtifact,
@@ -79,7 +78,9 @@ pub struct PingResponse {
 pub struct ResponseEnvelope {
     pub ok: bool,
     pub error: Option<String>,
-    pub data: Option<Value>,
+
+    #[serde(default)]
+    pub data: Value,
 }
 
 impl WireArtifact {

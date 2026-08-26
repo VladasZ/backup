@@ -1,7 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
@@ -20,10 +19,12 @@ pub struct ArchiveInfo {
     pub created: DateTime<Utc>,
 }
 
-const ARCHIVE_EXTENSIONS: [&str; 4] = [".tar", ".tar.gz", ".tar.zst", ".tar.zpaq"];
+const ARCHIVE_SUFFIX: &str = ".tar.lz4";
 
-// Archive names end with "-<uuid>.<ext>". A v4 UUID string is 36 characters, plus one leading dash.
-const UUID_SUFFIX_LEN: usize = 37;
+// Archive names are "<job>-<RFC3339 seconds>-<uuid>.tar.lz4". Both trailing parts have a fixed
+// width, so the job name is whatever is left after removing them, even when it contains a dash.
+const UUID_LEN: usize = 36;
+const TIMESTAMP_LEN: usize = 20;
 
 pub fn deliver_local(artifact: &Artifact, destination: &Path, job: &BackupJob) -> Result<()> {
     fs::create_dir_all(destination)
@@ -95,7 +96,6 @@ fn scan_archives(destination: &Path, job: &str) -> Result<Vec<ArchiveInfo>> {
     if !destination.exists() {
         return Ok(Vec::new());
     }
-    let prefix = format!("{job}-");
     let mut archives = Vec::new();
     for entry in fs::read_dir(destination)
         .with_context(|| format!("read destination {}", destination.display()))?
@@ -106,12 +106,13 @@ fn scan_archives(destination: &Path, job: &str) -> Result<Vec<ArchiveInfo>> {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.starts_with(&prefix) || !is_archive_name(&name) {
+        let Some(parsed) = parse_archive_name(&name) else {
+            continue;
+        };
+        if parsed.job != job {
             continue;
         }
-        let created = archive_created(&name, job).unwrap_or_else(|| {
-            DateTime::from(metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH))
-        });
+        let created = parsed.created;
         archives.push(ArchiveInfo {
             name,
             path: entry.path(),
@@ -129,16 +130,20 @@ fn scan_archives(destination: &Path, job: &str) -> Result<Vec<ArchiveInfo>> {
     Ok(archives)
 }
 
-fn archive_created(name: &str, job: &str) -> Option<DateTime<Utc>> {
-    let prefix = format!("{job}-");
-    let rest = name.strip_prefix(&prefix)?;
-    let rest = ARCHIVE_EXTENSIONS
-        .iter()
-        .find_map(|extension| rest.strip_suffix(extension))?;
-    let timestamp = rest.get(..rest.len().checked_sub(UUID_SUFFIX_LEN)?)?;
-    DateTime::parse_from_rfc3339(timestamp)
-        .ok()
-        .map(|value| value.with_timezone(&Utc))
+pub(crate) struct ParsedArchive<'name> {
+    pub job: &'name str,
+    pub created: DateTime<Utc>,
+}
+
+pub(crate) fn parse_archive_name(name: &str) -> Option<ParsedArchive<'_>> {
+    let rest = name.strip_suffix(ARCHIVE_SUFFIX)?;
+    let rest = rest.get(..rest.len().checked_sub(UUID_LEN + 1)?)?;
+    let split = rest.len().checked_sub(TIMESTAMP_LEN + 1)?;
+    let (job, stamp) = rest.split_at(split);
+    let created = DateTime::parse_from_rfc3339(stamp.strip_prefix('-')?)
+        .ok()?
+        .with_timezone(&Utc);
+    Some(ParsedArchive { job, created })
 }
 
 fn read_archive_checksum(archive: &Path) -> Option<String> {
@@ -215,10 +220,8 @@ pub fn checksum_path(archive: &Path) -> PathBuf {
     PathBuf::from(format!("{}.blake3", archive.display()))
 }
 
-pub(crate) fn is_archive_name(name: &str) -> bool {
-    ARCHIVE_EXTENSIONS
-        .iter()
-        .any(|extension| name.ends_with(extension))
+pub(crate) fn belongs_to_job(name: &str, job: &str) -> bool {
+    parse_archive_name(name).is_some_and(|parsed| parsed.job == job)
 }
 
 fn remove_if_present(path: &Path) -> Result<()> {
@@ -241,7 +244,10 @@ mod tests {
     use chrono::{Duration, Utc};
     use tempfile::tempdir;
 
-    use super::{ArchiveInfo, checksum_path, deliver_local, list_local, retention_removals};
+    use super::{
+        ArchiveInfo, apply_retention, checksum_path, deliver_local, list_local, parse_archive_name,
+        retention_removals,
+    };
     use crate::archive::{Artifact, checksum_file, read_checksum};
     use crate::config::{BackupJob, RetentionConfig};
     use crate::location::Location;
@@ -256,7 +262,7 @@ mod tests {
             group(4),
             group(12)
         );
-        format!("job-2026-07-17T{hour:02}:00:00Z-{uuid}.tar")
+        format!("job-2026-07-17T{hour:02}:00:00Z-{uuid}.tar.lz4")
     }
 
     #[test]
@@ -342,12 +348,49 @@ mod tests {
     }
 
     #[test]
+    fn retention_leaves_a_job_whose_name_starts_with_this_one_alone() {
+        let temporary = tempdir().unwrap();
+        let shared = temporary.path();
+        let mine = "docs-2026-07-17T01:00:00Z-00000000-0000-0000-0000-000000000000.tar.lz4";
+        let theirs =
+            "docs-archive-2026-07-17T02:00:00Z-11111111-1111-1111-1111-111111111111.tar.lz4";
+        fs::write(shared.join(mine), "mine").unwrap();
+        fs::write(shared.join(theirs), "theirs").unwrap();
+        let job = BackupJob {
+            name: "docs".to_owned(),
+            source: Location::Local(PathBuf::from("/source")),
+            destinations: vec![Location::Local(shared.to_path_buf())],
+            cron: "0 0 * * *".to_owned(),
+            retention: Some(RetentionConfig {
+                count: Some(1),
+                age: None,
+            }),
+            exclude: Vec::new(),
+        };
+
+        assert_eq!(list_local(shared, "docs").unwrap().len(), 1);
+        apply_retention(shared, &job).unwrap();
+
+        assert!(shared.join(mine).exists());
+        assert!(shared.join(theirs).exists());
+    }
+
+    #[test]
+    fn a_job_name_containing_dashes_still_parses() {
+        let name = "my-nice-job-2026-07-17T02:00:00Z-11111111-1111-1111-1111-111111111111.tar.lz4";
+        let parsed = parse_archive_name(name).unwrap();
+        assert_eq!(parsed.job, "my-nice-job");
+        assert_eq!(parsed.created.to_rfc3339(), "2026-07-17T02:00:00+00:00");
+        assert!(parse_archive_name("not-an-archive.txt").is_none());
+    }
+
+    #[test]
     fn count_retention_keeps_newest_archives() {
         let directory = tempdir().unwrap();
         let archives: Vec<_> = (0..4)
             .map(|offset| ArchiveInfo {
-                name: format!("job-{offset}.tar"),
-                path: directory.path().join(format!("job-{offset}.tar")),
+                name: format!("job-{offset}.tar.lz4"),
+                path: directory.path().join(format!("job-{offset}.tar.lz4")),
                 checksum: None,
                 size: 1,
                 created: Utc::now() - Duration::minutes(offset),
@@ -359,7 +402,7 @@ mod tests {
         };
         let removals = retention_removals(&archives, &retention).unwrap();
         assert_eq!(removals.len(), 2);
-        assert_eq!(removals[0].name, "job-2.tar");
+        assert_eq!(removals[0].name, "job-2.tar.lz4");
     }
 
     #[test]
@@ -369,11 +412,11 @@ mod tests {
         let destination = temporary.path().join("destination");
         fs::create_dir_all(&staging).unwrap();
         fs::create_dir_all(&destination).unwrap();
-        let archive_path = staging.join("job-archive.tar");
+        let archive_path = staging.join("job-archive.tar.lz4");
         fs::write(&archive_path, "healthy archive").unwrap();
         let checksum = checksum_file(&archive_path).unwrap();
         let artifact = Artifact {
-            name: "job-archive.tar".to_owned(),
+            name: "job-archive.tar.lz4".to_owned(),
             path: archive_path,
             checksum_path: PathBuf::new(),
             checksum: checksum.clone(),
@@ -382,7 +425,7 @@ mod tests {
         };
         let target = destination.join(&artifact.name);
         fs::write(&target, "corrupt").unwrap();
-        fs::write(checksum_path(&target), "wrong  job-archive.tar\n").unwrap();
+        fs::write(checksum_path(&target), "wrong  job-archive.tar.lz4\n").unwrap();
         let job = BackupJob {
             name: "job".to_owned(),
             source: Location::Local(PathBuf::from("/source")),

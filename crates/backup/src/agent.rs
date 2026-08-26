@@ -12,7 +12,7 @@ use crate::archive::{
     Artifact, create_local_archive, ensure_not_symlink, restore_archive, verify_archive,
     verify_checksum, write_checksum,
 };
-use crate::config::{BackupJob, CompressionConfig};
+use crate::config::BackupJob;
 use crate::destination::{apply_retention, list_local};
 use crate::location::Location;
 use crate::paths::AppPaths;
@@ -65,8 +65,7 @@ fn handle(request: AgentRequest, reader: &mut dyn BufRead, paths: &AppPaths) -> 
             job,
             source,
             exclude,
-            compression,
-        } => create_and_stream(job, source, exclude, compression, paths),
+        } => create_and_stream(job, source, exclude, paths),
         AgentRequest::Receive {
             artifact,
             destination,
@@ -129,7 +128,6 @@ fn create_and_stream(
     name: String,
     source: PathBuf,
     exclude: Vec<String>,
-    compression: CompressionConfig,
     paths: &AppPaths,
 ) -> Result<()> {
     require_staging_reserve(&paths.staging)?;
@@ -142,8 +140,7 @@ fn create_and_stream(
         retention: None,
         exclude,
     };
-    let artifact =
-        create_local_archive(&job, &compression, &source, &paths.job_staging(&job.name))?;
+    let artifact = create_local_archive(&job, &source, &paths.job_staging(&job.name))?;
     // Open the archive, then unlink both files at once. On Unix the open handle keeps the data
     // readable while we stream it, and the disk space is freed the moment this process ends, even
     // if ssh is killed mid-stream. So an interrupted transfer never leaks into remote staging.
@@ -252,11 +249,10 @@ fn receive_to_path(reader: &mut dyn BufRead, artifact: &WireArtifact, path: &Pat
 }
 
 fn write_success<T: Serialize>(data: &T) -> Result<()> {
-    let data = to_value(data)?;
     write_response(&ResponseEnvelope {
         ok: true,
         error: None,
-        data: Some(data),
+        data: to_value(data)?,
     })
 }
 
@@ -264,7 +260,7 @@ fn write_error(error: &str) -> Result<()> {
     write_response(&ResponseEnvelope {
         ok: false,
         error: Some(error.to_owned()),
-        data: None,
+        data: Value::Null,
     })
 }
 

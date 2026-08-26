@@ -9,7 +9,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, from_str, from_value, to_writer};
 
 use crate::archive::{Artifact, verify_checksum, write_checksum};
-use crate::config::{BackupJob, CompressionConfig};
+use crate::config::BackupJob;
 use crate::destination::ArchiveInfo;
 use crate::location::SshLocation;
 use crate::protocol::{
@@ -52,7 +52,6 @@ pub fn validate_destination(remote: &SshLocation) -> Result<()> {
 
 pub fn create_remote_archive(
     job: &BackupJob,
-    compression: &CompressionConfig,
     remote: &SshLocation,
     staging: &Path,
 ) -> Result<Artifact> {
@@ -61,7 +60,6 @@ pub fn create_remote_archive(
         job: job.name.clone(),
         source: remote.path.clone(),
         exclude: job.exclude.clone(),
-        compression: compression.clone(),
     };
     let (mut child, mut output, stderr) = spawn_stream(remote, &request)?;
     let wire: WireArtifact = match read_response(&mut output) {
@@ -367,8 +365,7 @@ fn read_response<T: DeserializeOwned>(reader: &mut dyn BufRead) -> Result<T> {
                     envelope.error.unwrap_or_else(|| "unknown error".to_owned())
                 );
             }
-            let data = envelope.data.context("agent response has no data")?;
-            return from_value(data).context("decode agent response");
+            return from_value(envelope.data).context("decode agent response");
         }
     }
 }

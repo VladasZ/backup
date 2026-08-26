@@ -8,20 +8,20 @@ rust-version = "1.97"
 
 [workspace.dependencies]
 anyhow = "1.0"
-blake3 = "1.8"
+blake3 = { version = "1.8", features = ["pure"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.6", features = ["derive"] }
 croner = "3.0"
 ctrlc = "3.5"
 directories = "6.0"
 file-rotate = "0.8"
-flate2 = "1.1"
 fs2 = "0.4"
 humantime = "2.4"
 ignore = "0.4"
+lz4_flex = "0.14"
 notify = "8.2"
 percent-encoding = "2.3"
-rusqlite = { version = "0.40", features = ["bundled"] }
+redb = "4.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sysinfo = "0.39"
@@ -34,5 +34,3 @@ url = "2.5"
 uuid = { version = "1.24", features = ["v4", "serde"] }
 walkdir = "2.5"
 xattr = "1.6"
-zpaq_rs = "1.0"
-zstd = "0.13"

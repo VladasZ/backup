@@ -4,9 +4,9 @@
 independent timestamped archives from local or SSH sources and delivers each
 archive to one or more local or SSH directories.
 
-The configuration is deliberately small: choose one compression algorithm,
-then give each job a source, destinations, UTC cron schedule, optional
-retention rule, and optional exclusions.
+The configuration is deliberately small: give each job a source, destinations,
+UTC cron schedule, optional retention rule, and optional exclusions. There is
+nothing else to choose.
 
 ## Features
 
@@ -15,7 +15,7 @@ retention rule, and optional exclusions.
 - Local and SSH sources and destinations.
 - Multiple independent destinations per job.
 - Full TAR archives with UTC timestamps and UUIDs.
-- Uncompressed TAR, gzip, zstd, and ZPAQ levels 3, 4, and 5.
+- LZ4 compressed TAR archives, readable by the standard `lz4` tool.
 - Infinite retention by default, with optional count or age retention.
 - Durable staging and destination-specific retries.
 - Atomic publication and BLAKE3 checksum files.
@@ -24,6 +24,7 @@ retention rule, and optional exclusions.
 - Gitignore-style exclusions configured per job.
 - Automatic configuration reload.
 - Rotating log files.
+- Pure Rust. No C or C++ source is compiled into the binary.
 
 ## Version 1 scope
 
@@ -35,8 +36,8 @@ requires an older archive.
 
 ## Install
 
-The repository pins its Rust toolchain. A C and C++ build toolchain is also
-needed because ZPAQ compiles native code.
+The repository pins its Rust toolchain. Nothing else is needed, since every
+dependency is pure Rust and no C source is compiled.
 
 ```sh
 git clone git@github.com:VladasZ/backup.git
@@ -94,9 +95,6 @@ See [`config.example.toml`](config.example.toml) for a complete multi-job
 configuration.
 
 ```toml
-[compression]
-algorithm = "zstd"
-
 [[backup]]
 name = "documents"
 source = "/home/alice/Documents"
@@ -117,22 +115,14 @@ contain `..`. A destination cannot equal the source or be inside it.
 
 ### Compression
 
-Compression is global for all jobs.
+Archives are always LZ4. There is no setting, because measurement did not
+support one. LZ4 compresses at over 500 MiB/s and costs about 1 second of CPU
+per GiB, so it is close to free on any job. Slower algorithms make smaller
+archives on text, but a backup runs unattended every night and the archive
+travels to its destinations, so speed and predictable cost matter more.
 
-- `none` creates `.tar` archives.
-- `gzip` creates `.tar.gz` archives.
-- `zstd` creates `.tar.zst` archives.
-- `zpaq` creates `.tar.zpaq` archives.
-
-Only ZPAQ accepts a level, and it requires level `3`, `4`, or `5`:
-
-```toml
-[compression]
-algorithm = "zpaq"
-level = 4
-```
-
-Higher ZPAQ levels use more time and memory.
+Archives are written as `.tar.lz4` and can be opened with the standard `lz4`
+tool without this program.
 
 ### Job fields
 
@@ -192,7 +182,7 @@ cron = "30 3 * * 1"  # Monday at 03:30 UTC
 cron = "0 */6 * * *" # every six hours
 ```
 
-The daemon stores the latest handled slot in SQLite. On startup it immediately
+The daemon stores the latest handled slot in its state database. On startup it immediately
 runs one catch-up backup when the latest slot was missed. The first daemon
 start therefore schedules every configured job once.
 
@@ -308,7 +298,7 @@ Restore an exact archive:
 
 ```sh
 backup restore documents \
-  documents-2026-07-17T02:00:00Z-01234567-89ab-cdef-0123-456789abcdef.tar.zst \
+  documents-2026-07-17T02:00:00Z-01234567-89ab-cdef-0123-456789abcdef.tar.lz4 \
   --to /srv/documents
 ```
 
@@ -400,7 +390,7 @@ Names use this form:
 For example:
 
 ```text
-documents-2026-07-17T02:00:00Z-01234567-89ab-cdef-0123-456789abcdef.tar.zst
+documents-2026-07-17T02:00:00Z-01234567-89ab-cdef-0123-456789abcdef.tar.lz4
 ```
 
 Every archive has a neighboring `.blake3` checksum file. Archives and
@@ -429,7 +419,7 @@ repaired after the archive itself is verified.
 Staging is deleted only after all destinations finish. Removing a job from the
 configuration does not cancel its recorded pending deliveries.
 
-On startup, complete staged archives not yet recorded in SQLite are verified
+On startup, complete staged archives not yet recorded in the state database are verified
 and recovered for matching active jobs. Corrupt staged archives are preserved
 and logged for inspection.
 
@@ -507,6 +497,22 @@ Logs:
 Logs rotate at 10 MiB and keep nine rotated files plus the current file.
 `RUST_LOG` controls the log filter; the default is `info`. The staging path is
 not configurable.
+
+## Development
+
+```sh
+make ci     # typos, fmt, clippy with -D warnings, unused dependency check
+make test   # unit and integration tests, debug and release
+make build  # release binary
+```
+
+`make ci` needs `typos-cli` and `cargo-machete`. GitHub Actions runs both
+targets on Linux for every push and pull request.
+
+The integration tests under `crates/backup/tests/` drive the real binary. The
+SSH tests start a container running sshd and exercise every combination of
+local and SSH source and destination, so they need Docker. They print a skip
+line and pass when Docker is not running.
 
 ## Troubleshooting
 

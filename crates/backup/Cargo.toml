@@ -13,13 +13,13 @@ croner = { workspace = true }
 ctrlc = { workspace = true, features = ["termination"] }
 directories = { workspace = true }
 file-rotate = { workspace = true }
-flate2 = { workspace = true }
 fs2 = { workspace = true }
 humantime = { workspace = true }
 ignore = { workspace = true }
+lz4_flex = { workspace = true }
 notify = { workspace = true }
 percent-encoding = { workspace = true }
-rusqlite = { workspace = true }
+redb = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sysinfo = { workspace = true }
@@ -32,5 +32,3 @@ url = { workspace = true }
 uuid = { workspace = true }
 walkdir = { workspace = true }
 xattr = { workspace = true }
-zpaq_rs = { workspace = true }
-zstd = { workspace = true }

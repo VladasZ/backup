@@ -12,27 +12,11 @@ use crate::location::Location;
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    pub compression: CompressionConfig,
-
     #[serde(rename = "backup")]
     pub jobs: Vec<BackupJob>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CompressionConfig {
-    pub algorithm: CompressionAlgorithm,
-    pub level: Option<u8>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum CompressionAlgorithm {
-    None,
-    Gzip,
-    Zstd,
-    Zpaq,
-}
+pub const ARCHIVE_EXTENSION: &str = "tar.lz4";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -65,7 +49,6 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
-        self.compression.validate()?;
         if self.jobs.is_empty() {
             bail!("configuration must contain at least one [[backup]] job");
         }
@@ -84,29 +67,6 @@ impl Config {
             .iter()
             .find(|job| job.name == name)
             .with_context(|| format!("unknown backup job {name:?}"))
-    }
-}
-
-impl CompressionConfig {
-    pub fn validate(&self) -> Result<()> {
-        match (self.algorithm, self.level) {
-            (CompressionAlgorithm::Zpaq, Some(3..=5)) => Ok(()),
-            (CompressionAlgorithm::Zpaq, Some(level)) => {
-                bail!("ZPAQ level must be 3, 4, or 5, got {level}")
-            }
-            (CompressionAlgorithm::Zpaq, None) => bail!("ZPAQ compression requires a level"),
-            (_, Some(_)) => bail!("compression level is only supported for ZPAQ"),
-            (_, None) => Ok(()),
-        }
-    }
-
-    pub fn extension(&self) -> &'static str {
-        match self.algorithm {
-            CompressionAlgorithm::None => "tar",
-            CompressionAlgorithm::Gzip => "tar.gz",
-            CompressionAlgorithm::Zstd => "tar.zst",
-            CompressionAlgorithm::Zpaq => "tar.zpaq",
-        }
     }
 }
 
@@ -192,16 +152,12 @@ impl RetentionConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{CompressionAlgorithm, Config};
+    use super::Config;
 
     #[test]
     fn parses_multiple_jobs() {
         let config: Config = toml::from_str(
             r#"
-[compression]
-algorithm = "zpaq"
-level = 4
-
 [[backup]]
 name = "documents"
 source = "/source"
@@ -220,16 +176,12 @@ cron = "0 4 * * 0"
         .unwrap();
         config.validate().unwrap();
         assert_eq!(config.jobs.len(), 2);
-        assert_eq!(config.compression.algorithm, CompressionAlgorithm::Zpaq);
     }
 
     #[test]
     fn rejects_both_retention_modes() {
         let config: Config = toml::from_str(
             r#"
-[compression]
-algorithm = "zstd"
-
 [[backup]]
 name = "bad"
 source = "/source"

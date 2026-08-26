@@ -4,7 +4,7 @@ use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use notify::{Event, RecursiveMode, Result as NotifyResult, Watcher, recommended_watcher};
 use tracing::{error, info, warn};
 
@@ -130,6 +130,9 @@ fn unhandled_slot(
         .schedule()?
         .find_previous_occurrence(&now, true)
         .with_context(|| format!("find latest schedule for job {:?}", job.name))?;
+    let latest = latest
+        .with_nanosecond(0)
+        .context("cron slot has no whole second")?;
     Ok((!last.is_some_and(|last| last >= latest)).then_some(latest))
 }
 
@@ -162,7 +165,7 @@ fn reload_config(runner: &mut Runner) {
 mod tests {
     use std::path::PathBuf;
 
-    use chrono::{Duration, TimeZone, Utc};
+    use chrono::{DateTime, Duration, TimeZone, Timelike, Utc};
 
     use super::{due_backup, unhandled_slot};
     use crate::config::BackupJob;
@@ -194,6 +197,30 @@ mod tests {
         assert_eq!(due_backup(Some(newer), Some(waiting), now), Some(newer));
 
         assert_eq!(due_backup(None, Some(waiting), now), None);
+    }
+
+    #[test]
+    fn a_handled_slot_stays_handled_when_the_clock_has_a_sub_second_part() {
+        let job = BackupJob {
+            name: "documents".to_owned(),
+            source: Location::Local(PathBuf::from("/source")),
+            destinations: vec![Location::Local(PathBuf::from("/destination"))],
+            cron: "0 2 * * *".to_owned(),
+            retention: None,
+            exclude: Vec::new(),
+        };
+        let now = Utc
+            .with_ymd_and_hms(2026, 7, 17, 18, 1, 52)
+            .unwrap()
+            .with_nanosecond(644_228_000)
+            .unwrap();
+        let slot = unhandled_slot(&job, None, now).unwrap().unwrap();
+
+        assert_eq!(slot.nanosecond(), 0);
+
+        let stored = DateTime::from_timestamp(slot.timestamp(), 0).unwrap();
+        let later = now + Duration::milliseconds(900);
+        assert_eq!(unhandled_slot(&job, Some(stored), later).unwrap(), None);
     }
 
     #[test]

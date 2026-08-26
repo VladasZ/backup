@@ -1,0 +1,71 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install toolchain components
+        run: rustup component add rustfmt clippy
+
+      - name: Install quality tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: typos-cli@1.48.0,cargo-machete@0.9.2
+
+      - name: Run quality checks
+        run: make ci
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Run tests
+        run: make test
+
+  install:
+    name: Install Service
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build
+        run: make build
+
+      - name: Validate the example configuration
+        run: |
+          mkdir -p "$HOME/source" "$HOME/backups" "$HOME/.config/backup"
+          echo hello > "$HOME/source/hello.txt"
+          cat > "$HOME/.config/backup/config.toml" <<EOF
+          [compression]
+          algorithm = "zstd"
+
+          [[backup]]
+          name = "documents"
+          source = "$HOME/source"
+          destinations = ["$HOME/backups"]
+          cron = "0 2 * * *"
+          retention = { count = 3 }
+          EOF
+          ./target/release/backup validate
+          ./target/release/backup run documents
+          ./target/release/backup verify documents
+          ./target/release/backup restore documents --to "$HOME/restored" --yes
+          test "$(cat "$HOME/restored/hello.txt")" = hello
