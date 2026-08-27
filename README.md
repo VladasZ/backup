@@ -22,7 +22,7 @@ nothing else to choose.
 - Atomic publication and BLAKE3 checksum files.
 - Pre/post source catalogs that report files changed during the archive pass.
 - Symbolic links, hard links, metadata, ownership, and extended attributes.
-- Sockets, FIFOs, and device files are skipped with a warning.
+- Sockets, FIFOs, device files, and unreadable entries are skipped with a warning.
 - Thirty days of completed run history.
 - Gitignore-style exclusions configured per job.
 - Automatic configuration reload.
@@ -141,7 +141,10 @@ Each `[[backup]]` record contains:
 A source may be one regular file or a directory. The source path itself must not
 be a symlink, and a symlink source is rejected at validate and run time.
 Symlinks found inside the source are stored as symlinks as usual. Sockets, device
-files, FIFOs, and other special files are skipped and logged.
+files, FIFOs, and other special files are skipped and logged. A file or directory
+the service cannot read, for example because of permissions, is also skipped and
+logged, so one unreadable entry does not fail the whole backup. Only the source
+path itself must be readable.
 
 ### SSH locations
 

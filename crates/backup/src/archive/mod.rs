@@ -67,14 +67,93 @@ pub fn create_local_archive(
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::{MetadataExt, symlink};
-    use std::path::PathBuf;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    use std::path::{Path, PathBuf};
 
     use tempfile::tempdir;
 
     use super::{create_local_archive, read_checksum, restore_archive, verify_archive};
     use crate::config::{BackupJob, RetentionConfig};
     use crate::location::Location;
+
+    fn job(source: &Path) -> BackupJob {
+        BackupJob {
+            name: "test".to_owned(),
+            source: Location::Local(source.to_path_buf()),
+            destinations: vec![Location::Local(PathBuf::from("/unused"))],
+            cron: "0 0 * * *".to_owned(),
+            retention: None,
+            exclude: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn link_targets_longer_than_a_tar_header_field_round_trip() {
+        let temporary = tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let restored = temporary.path().join("restored");
+        let deep = source.join("a".repeat(60)).join("b".repeat(60));
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("file.txt"), "linked").unwrap();
+        fs::hard_link(deep.join("file.txt"), source.join("hard-link")).unwrap();
+        let target = PathBuf::from("/").join("x".repeat(150)).join("target");
+        symlink(&target, source.join("symbolic-link")).unwrap();
+
+        let artifact =
+            create_local_archive(&job(&source), &source, &temporary.path().join("staging"))
+                .unwrap();
+        verify_archive(&artifact.path).unwrap();
+        restore_archive(&artifact.path, &restored).unwrap();
+
+        assert_eq!(
+            fs::read_link(restored.join("symbolic-link")).unwrap(),
+            target
+        );
+        assert_eq!(
+            fs::metadata(restored.join("hard-link")).unwrap().ino(),
+            fs::metadata(
+                restored
+                    .join("a".repeat(60))
+                    .join("b".repeat(60))
+                    .join("file.txt")
+            )
+            .unwrap()
+            .ino()
+        );
+    }
+
+    #[test]
+    fn an_unreadable_file_is_skipped_and_the_rest_is_archived() {
+        let temporary = tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let restored = temporary.path().join("restored");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("readable.txt"), "fine").unwrap();
+        let locked = source.join("locked.txt");
+        fs::write(&locked, "secret").unwrap();
+        fs::set_permissions(&locked, PermissionsExt::from_mode(0o000)).unwrap();
+        if fs::read(&locked).is_ok() {
+            eprintln!("skipping: this user can read a mode 000 file");
+            return;
+        }
+        fs::write(source.join("zebra.txt"), "after").unwrap();
+
+        let artifact =
+            create_local_archive(&job(&source), &source, &temporary.path().join("staging"))
+                .unwrap();
+        verify_archive(&artifact.path).unwrap();
+        restore_archive(&artifact.path, &restored).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(restored.join("readable.txt")).unwrap(),
+            "fine"
+        );
+        assert_eq!(
+            fs::read_to_string(restored.join("zebra.txt")).unwrap(),
+            "after"
+        );
+        assert!(!restored.join("locked.txt").exists());
+    }
 
     #[test]
     fn creates_and_restores_an_archive() {

@@ -37,6 +37,19 @@ pub struct Walk {
     pub fingerprints: Vec<Fingerprint>,
     pub skipped_mounts: Vec<PathBuf>,
     pub skipped_special: Vec<PathBuf>,
+    pub skipped_unreadable: Vec<Unreadable>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Unreadable {
+    pub path: PathBuf,
+    pub reason: String,
+}
+
+#[derive(Debug)]
+pub enum Visit {
+    Stored,
+    Unreadable(String),
 }
 
 pub struct SourceScanner {
@@ -78,7 +91,7 @@ impl SourceScanner {
         })
     }
 
-    pub fn walk(&self, visit: &mut dyn FnMut(&Entry) -> Result<()>) -> Result<Walk> {
+    pub fn walk(&self, visit: &mut dyn FnMut(&Entry) -> Result<Visit>) -> Result<Walk> {
         let mut walk = Walk::default();
         if self.source_is_file {
             let relative = self
@@ -90,8 +103,12 @@ impl SourceScanner {
                 .with_context(|| format!("read metadata {}", self.source.display()))?;
             let entry = entry(&self.source, relative, metadata)?
                 .with_context(|| format!("source {} is a special file", self.source.display()))?;
-            walk.fingerprints.push(fingerprint(&entry));
-            visit(&entry)?;
+            match visit(&entry)? {
+                Visit::Stored => walk.fingerprints.push(fingerprint(&entry)),
+                Visit::Unreadable(reason) => {
+                    bail!("read source {}: {reason}", self.source.display())
+                }
+            }
             return Ok(walk);
         }
 
@@ -100,13 +117,35 @@ impl SourceScanner {
             .sort_by_file_name()
             .into_iter();
         while let Some(item) = walker.next() {
-            let item = item.with_context(|| format!("walk source {}", self.source.display()))?;
+            let item = match item {
+                Ok(item) => item,
+                Err(error) => {
+                    let path = error.path().unwrap_or(&self.source).to_path_buf();
+                    if path == self.source {
+                        return Err(error)
+                            .with_context(|| format!("walk source {}", self.source.display()));
+                    }
+                    walk.skipped_unreadable.push(Unreadable {
+                        path,
+                        reason: error.to_string(),
+                    });
+                    continue;
+                }
+            };
             let path = item.path();
             if path == self.source {
                 continue;
             }
-            let metadata = fs::symlink_metadata(path)
-                .with_context(|| format!("read metadata {}", path.display()))?;
+            let metadata = match fs::symlink_metadata(path) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    walk.skipped_unreadable.push(Unreadable {
+                        path: path.to_path_buf(),
+                        reason: error.to_string(),
+                    });
+                    continue;
+                }
+            };
             let is_directory = metadata.is_dir();
             if self.mounts.contains(path) || metadata.dev() != self.root_device {
                 if is_directory {
@@ -129,17 +168,34 @@ impl SourceScanner {
                 .strip_prefix(&self.source)
                 .context("walked path escaped source")?
                 .to_path_buf();
-            let Some(entry) = entry(path, relative, metadata)? else {
-                walk.skipped_special.push(path.to_path_buf());
-                continue;
+            let entry = match entry(path, relative, metadata) {
+                Ok(Some(entry)) => entry,
+                Ok(None) => {
+                    walk.skipped_special.push(path.to_path_buf());
+                    continue;
+                }
+                Err(error) => {
+                    walk.skipped_unreadable.push(Unreadable {
+                        path: path.to_path_buf(),
+                        reason: format!("{error:#}"),
+                    });
+                    continue;
+                }
             };
-            walk.fingerprints.push(fingerprint(&entry));
-            visit(&entry)?;
+            match visit(&entry)? {
+                Visit::Stored => walk.fingerprints.push(fingerprint(&entry)),
+                Visit::Unreadable(reason) => walk.skipped_unreadable.push(Unreadable {
+                    path: path.to_path_buf(),
+                    reason,
+                }),
+            }
         }
         walk.fingerprints
             .sort_by(|left, right| left.relative.cmp(&right.relative));
         walk.skipped_mounts.sort();
         walk.skipped_special.sort();
+        walk.skipped_unreadable
+            .sort_by(|left, right| left.path.cmp(&right.path));
         Ok(walk)
     }
 }
@@ -314,7 +370,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{Fingerprint, SourceScanner, changed_paths};
+    use super::{Fingerprint, SourceScanner, Visit, changed_paths};
 
     #[test]
     fn rejects_a_symlink_source() {
@@ -341,7 +397,7 @@ mod tests {
         let walk = scanner
             .walk(&mut |entry| {
                 seen.push(entry.relative.clone());
-                Ok(())
+                Ok(Visit::Stored)
             })
             .unwrap();
         drop(socket);

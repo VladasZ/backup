@@ -1,7 +1,9 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+
+use crate::lock::AppLock;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{from_str, to_string};
@@ -12,38 +14,62 @@ pub const DELIVERIES: TableDefinition<'static, (&str, &str), &str> =
 pub const SCHEDULES: TableDefinition<'static, &str, i64> = TableDefinition::new("schedules");
 pub const RETRIES: TableDefinition<'static, &str, &str> = TableDefinition::new("retries");
 
+// redb allows one open handle per database, so the daemon and the CLI commands cannot both
+// keep it open. Every operation takes a lock, opens the file, works, and closes it again.
 pub struct Store {
-    database: Database,
+    path: PathBuf,
+    lock: PathBuf,
 }
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
-        let database = Database::create(path)
-            .with_context(|| format!("open state database {}", path.display()))?;
+        let store = Self {
+            path: path.to_path_buf(),
+            lock: PathBuf::from(format!("{}.lock", path.display())),
+        };
+        let lock = AppLock::exclusive(&store.lock)?;
+        let database = store.database()?;
         let transaction = database.begin_write()?;
         transaction.open_table(RUNS)?;
         transaction.open_table(DELIVERIES)?;
         transaction.open_table(SCHEDULES)?;
         transaction.open_table(RETRIES)?;
         transaction.commit()?;
-        Ok(Self { database })
+        drop(database);
+        drop(lock);
+        Ok(store)
+    }
+
+    fn database(&self) -> Result<Database> {
+        Database::create(&self.path)
+            .with_context(|| format!("open state database {}", self.path.display()))
     }
 
     pub fn read<T>(
         &self,
         operation: impl FnOnce(&redb::ReadTransaction) -> Result<T>,
     ) -> Result<T> {
-        let transaction = self.database.begin_read()?;
-        operation(&transaction)
+        let lock = AppLock::exclusive(&self.lock)?;
+        let database = self.database()?;
+        let transaction = database.begin_read()?;
+        let value = operation(&transaction);
+        drop(transaction);
+        drop(database);
+        drop(lock);
+        value
     }
 
     pub fn write<T>(
         &self,
         operation: impl FnOnce(&redb::WriteTransaction) -> Result<T>,
     ) -> Result<T> {
-        let transaction = self.database.begin_write()?;
+        let lock = AppLock::exclusive(&self.lock)?;
+        let database = self.database()?;
+        let transaction = database.begin_write()?;
         let value = operation(&transaction)?;
         transaction.commit()?;
+        drop(database);
+        drop(lock);
         Ok(value)
     }
 }

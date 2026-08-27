@@ -216,6 +216,23 @@ fn daemon_handles_a_due_slot_once_and_then_stays_idle() {
 }
 
 #[test]
+fn cli_commands_work_while_the_daemon_runs() {
+    let sandbox = Sandbox::new();
+    fs::write(sandbox.source().join("keep.txt"), "keep me").expect("write source file");
+    sandbox.write_config(&job_config("documents", &sandbox, "0 2 * * *", ""));
+
+    let daemon = Daemon::start(&sandbox);
+    sleep(IDLE_WATCH);
+
+    let status = sandbox.run(&["status"]);
+    assert!(String::from_utf8_lossy(&status.stdout).contains("no pending deliveries"));
+    sandbox.run(&["run", "documents"]);
+    let history = sandbox.run(&["history", "documents"]);
+    assert!(String::from_utf8_lossy(&history.stdout).contains("documents-"));
+    drop(daemon);
+}
+
+#[test]
 fn retention_keeps_only_the_configured_number_of_archives() {
     let sandbox = Sandbox::new();
     fs::write(sandbox.source().join("keep.txt"), "keep me").expect("write source file");

@@ -6,7 +6,7 @@ use anyhow::{Error, Result};
 use blake3::Hasher;
 use tracing::warn;
 
-use super::catalog::{SourceScanner, changed_paths};
+use super::catalog::{SourceScanner, Visit, changed_paths};
 use super::format::ArchiveWriter;
 use crate::config::BackupJob;
 use crate::location::Location;
@@ -162,7 +162,10 @@ pub fn pump_local(job: &BackupJob, scanner: &SourceScanner, mut tee: Tee) -> Res
     for special in &before.skipped_special {
         warn!(job = job.name, path = %special.display(), "skipping special file");
     }
-    let changed = match scanner.walk(&mut |_| Ok(())) {
+    for unreadable in &before.skipped_unreadable {
+        warn!(job = job.name, path = %unreadable.path.display(), reason = unreadable.reason, "skipping unreadable entry");
+    }
+    let changed = match scanner.walk(&mut |_| Ok(Visit::Stored)) {
         Ok(after) => changed_paths(&before.fingerprints, &after.fingerprints),
         Err(error) => {
             warn!(job = job.name, %error, "could not rescan the source after archiving; consistency is unknown");
