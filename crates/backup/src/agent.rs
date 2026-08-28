@@ -10,8 +10,9 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::archive::{
-    Artifact, HashingWriter, Sink, SinkId, SourceScanner, Tee, archive_name, ensure_not_symlink,
-    pump_local, restore_archive, verify_archive, verify_checksum, write_checksum,
+    Artifact, HashingWriter, Sink, SinkId, SourceScanner, Tee, archive_name, create_private,
+    ensure_not_symlink, pump_local, restore_archive, verify_archive, verify_checksum,
+    write_checksum,
 };
 use crate::config::BackupJob;
 use crate::destination::{apply_retention, belongs_to_job, list_local, sweep_stale_partials};
@@ -230,8 +231,7 @@ fn receive_stream(
     sweep_stale_partials(destination);
     let partial = destination.join(format!(".{name}-{}.partial", Uuid::new_v4()));
     let received = (|| {
-        let file =
-            File::create(&partial).with_context(|| format!("create {}", partial.display()))?;
+        let file = create_private(&partial)?;
         let mut writer = HashingWriter::new(file);
         let size = copy_frames(reader, &mut writer)?;
         writer.inner.sync_all()?;
@@ -271,7 +271,7 @@ fn receive_stream(
 fn receive_to_path(reader: &mut dyn BufRead, artifact: &WireArtifact, path: &Path) -> Result<()> {
     remove_if_present(path)?;
     let receive_result = (|| {
-        let mut file = File::create(path).with_context(|| format!("create {}", path.display()))?;
+        let mut file = create_private(path)?;
         let copied = copy(&mut reader.take(artifact.size), &mut file)?;
         file.flush()?;
         file.sync_all()?;

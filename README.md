@@ -315,6 +315,12 @@ when a delivery has been pending for over one hour, or when a job that is no
 longer in the configuration still has pending deliveries. There is no setting
 for the grace period.
 
+While a backup, delivery, or restore is running, the grace period is 24 hours
+instead of one hour, so a run that takes several hours does not report as a
+problem while it is still moving data. The queue is serial, so jobs waiting
+behind it are covered by the same rule. The report says when an operation is
+running.
+
 Only the daemon marks scheduled slots as handled, so a machine that never runs
 the daemon reports its slots as missed. Health is a check on the scheduled
 service, not on manual runs.
@@ -390,6 +396,17 @@ backup verify documents --archive latest
 Verification checks BLAKE3 and reads every TAR entry through the selected
 decompressor, locally or through the remote agent. `--archive latest` checks
 only the newest archive, resolved per job.
+
+### Cancel pending deliveries
+
+```sh
+backup forget documents
+```
+
+Forget cancels every pending delivery of one job and deletes its staged
+archives. Archives already delivered stay where they are. For a job that is no
+longer in the configuration it also clears the stored schedule and retry
+state, so nothing is left behind and health stops reporting it.
 
 ### Apply retention now
 
@@ -529,7 +546,10 @@ daemon startup. A transfer that is still running is never touched, since its
 partial file keeps a fresh modification time.
 
 Removing a job from the configuration does not cancel its recorded pending
-deliveries.
+deliveries. Use `backup forget` to cancel them.
+
+Archive and checksum files are created readable only by their owner, so other
+users of a shared destination cannot read backup contents.
 
 On startup, complete staged archives not yet recorded in the state database are verified
 and recovered for matching active jobs. Corrupt staged archives are preserved

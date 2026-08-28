@@ -1,5 +1,5 @@
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, ErrorKind, Write};
+use std::fs::{self, File};
+use std::io::{self, ErrorKind, Write, copy};
 use std::path::{Path, PathBuf};
 use std::time::{Duration as StdDuration, SystemTime};
 
@@ -7,7 +7,9 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use tracing::{info, warn};
 
-use crate::archive::{Artifact, Sink, SinkId, read_checksum, verify_checksum, write_checksum};
+use crate::archive::{
+    Artifact, Sink, SinkId, create_private, read_checksum, verify_checksum, write_checksum,
+};
 use crate::config::{BackupJob, RetentionConfig};
 use crate::location::Location;
 use crate::retention::milestone_keepers;
@@ -29,8 +31,7 @@ impl LocalSink {
         sweep_stale_partials(destination);
         let partial = destination.join(format!(".{name}.partial"));
         remove_if_present(&partial)?;
-        let file =
-            File::create(&partial).with_context(|| format!("create {}", partial.display()))?;
+        let file = create_private(&partial)?;
         Ok(Box::new(Self {
             destination: destination.to_path_buf(),
             partial,
@@ -132,14 +133,18 @@ pub fn deliver_local(artifact: &Artifact, destination: &Path, job: &BackupJob) -
 
     let partial = destination.join(format!(".{}.partial", artifact.name));
     remove_if_present(&partial)?;
-    fs::copy(&artifact.path, &partial).with_context(|| {
+    let mut source = File::open(&artifact.path)
+        .with_context(|| format!("open staged archive {}", artifact.path.display()))?;
+    let mut file = create_private(&partial)?;
+    copy(&mut source, &mut file).with_context(|| {
         format!(
             "copy archive {} to {}",
             artifact.path.display(),
             partial.display()
         )
     })?;
-    OpenOptions::new().read(true).open(&partial)?.sync_all()?;
+    file.sync_all()?;
+    drop(file);
     verify_checksum(&partial, &artifact.checksum)?;
     publish(&partial, &target, &artifact.checksum)?;
     info!(
@@ -632,6 +637,45 @@ mod tests {
 
         assert_eq!(removals.len(), 1);
         assert_eq!(removals[0].name, "job-8.tar.lz4");
+    }
+
+    #[test]
+    fn delivered_archives_are_readable_only_by_their_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempdir().unwrap();
+        let staging = temporary.path().join("staging");
+        let destination = temporary.path().join("destination");
+        fs::create_dir_all(&staging).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        let name = archive_name(3, 'c');
+        let archive_path = staging.join(&name);
+        fs::write(&archive_path, "private data").unwrap();
+        let checksum = checksum_file(&archive_path).unwrap();
+        let artifact = Artifact {
+            name: name.clone(),
+            path: archive_path,
+            checksum_path: PathBuf::new(),
+            checksum,
+            size: 12,
+            created_at: Utc::now(),
+        };
+        let job = BackupJob {
+            name: "job".to_owned(),
+            source: Location::Local(PathBuf::from("/source")),
+            destinations: vec![Location::Local(destination.clone())],
+            cron: "0 0 * * *".to_owned(),
+            retention: None,
+            exclude: Vec::new(),
+        };
+
+        deliver_local(&artifact, &destination, &job).unwrap();
+
+        let mode = fs::metadata(destination.join(&name))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]

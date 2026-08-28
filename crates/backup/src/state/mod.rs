@@ -17,8 +17,8 @@ use crate::config::BackupJob;
 use crate::location::Location;
 
 pub use records::{
-    BackupRetry, CompletedRun, DeliveryResult, DeliveryStatus, HistoryLine, PendingDelivery,
-    StatusLine,
+    BackupRetry, CompletedRun, DeliveryResult, DeliveryStatus, ForgottenRun, HistoryLine,
+    PendingDelivery, StatusLine,
 };
 use records::{DeliveryRecord, RetryRecord, RunRecord};
 use redb::ReadableTable;
@@ -322,6 +322,52 @@ impl State {
                 }
             }
             Ok(expired.len())
+        })
+    }
+
+    // Drops every run of the job that still has undelivered destinations, so a
+    // job removed from the configuration stops retrying forever. Completed runs
+    // stay for history. The schedule and retry rows go only when the caller says
+    // so, since clearing them for a job still in the configuration would make
+    // the daemon rerun its latest slot as a catch-up.
+    pub fn forget_job(&mut self, job: &str, clear_schedule: bool) -> Result<Vec<ForgottenRun>> {
+        self.store.write(|transaction| {
+            let cancelled: Vec<(String, RunRecord)> = {
+                let runs = transaction.open_table(RUNS)?;
+                let mut cancelled = Vec::new();
+                for entry in runs.iter()? {
+                    let (key, value) = entry?;
+                    let record: RunRecord = decode(value.value())?;
+                    if record.job.name == job && record.completed_at.is_none() {
+                        cancelled.push((key.value().to_owned(), record));
+                    }
+                }
+                cancelled
+            };
+            let mut runs = transaction.open_table(RUNS)?;
+            let mut deliveries = transaction.open_table(DELIVERIES)?;
+            let mut forgotten = Vec::new();
+            for (run_id, record) in cancelled {
+                runs.remove(run_id.as_str())?;
+                let destinations: Vec<String> = deliveries
+                    .range((run_id.as_str(), "")..(run_id.as_str(), "\u{10FFFF}"))?
+                    .map(|entry| entry.map(|(key, _)| key.value().1.to_owned()))
+                    .collect::<Result<_, _>>()?;
+                for destination in destinations {
+                    deliveries.remove((run_id.as_str(), destination.as_str()))?;
+                }
+                forgotten.push(ForgottenRun {
+                    archive_name: record.archive_name,
+                    archive: record.archive_path,
+                    checksum: record.checksum_path,
+                    staged: record.staged,
+                });
+            }
+            if clear_schedule {
+                transaction.open_table(SCHEDULES)?.remove(job)?;
+                transaction.open_table(RETRIES)?.remove(job)?;
+            }
+            Ok(forgotten)
         })
     }
 

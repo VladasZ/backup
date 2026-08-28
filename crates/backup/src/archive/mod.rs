@@ -5,8 +5,11 @@ mod restore;
 mod staging;
 mod stream;
 
-use std::path::PathBuf;
+use std::fs::{File, OpenOptions};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 
+use anyhow::{Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
 
 use crate::config::ARCHIVE_EXTENSION;
@@ -27,6 +30,19 @@ pub struct Artifact {
     pub checksum: String,
     pub size: u64,
     pub created_at: DateTime<Utc>,
+}
+
+// Backups can hold private data, so archive files never get the default umask
+// where another user of a shared destination could read them. Renames keep the
+// mode, so a published archive stays 0600.
+pub fn create_private(path: &Path) -> Result<File> {
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("create {}", path.display()))
 }
 
 pub fn archive_name(job: &str, created_at: DateTime<Utc>) -> String {

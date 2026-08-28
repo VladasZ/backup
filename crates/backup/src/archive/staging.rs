@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use super::checksum::write_checksum;
+use super::create_private;
 use super::stream::{Sink, SinkId};
 use crate::storage::warn_if_high;
 
@@ -21,8 +22,7 @@ impl StagingSink {
         warn_if_high(staging, "staging")?;
         let partial = staging.join(format!(".{name}.partial"));
         remove_if_present(&partial)?;
-        let file =
-            File::create(&partial).with_context(|| format!("create {}", partial.display()))?;
+        let file = create_private(&partial)?;
         Ok(Box::new(Self {
             partial,
             final_path: staging.join(name),

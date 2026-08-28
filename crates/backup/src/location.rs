@@ -129,6 +129,12 @@ fn parse_ssh(value: &str) -> Result<SshLocation> {
         bail!("SSH locations cannot contain a query or fragment");
     }
     let host = url.host_str().context("SSH location is missing a host")?;
+    if host.starts_with('-') {
+        bail!("SSH host cannot start with '-': {host:?}");
+    }
+    if url.username().starts_with('-') {
+        bail!("SSH user cannot start with '-': {:?}", url.username());
+    }
     let decoded = percent_decode_str(url.path())
         .decode_utf8()
         .context("SSH path is not valid UTF-8")?;
@@ -174,6 +180,17 @@ mod tests {
                 path: PathBuf::from("/mnt/backup"),
             })
         );
+    }
+
+    #[test]
+    fn rejects_a_host_or_user_that_could_be_read_as_an_ssh_option() {
+        assert!(
+            "ssh://-oProxyCommand=evil/path"
+                .parse::<Location>()
+                .is_err()
+        );
+        assert!("ssh://-badhost/path".parse::<Location>().is_err());
+        assert!("ssh://-baduser@host/path".parse::<Location>().is_err());
     }
 
     #[test]

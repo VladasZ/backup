@@ -166,12 +166,34 @@ fn execute(cli: Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Command::Forget { job } => {
+            let mut runner = Runner::new(Config::load(&paths.config)?, paths)?;
+            let in_config = runner.config.jobs.iter().any(|item| item.name == job);
+            let cancelled = runner.forget(&job, !in_config)?;
+            let report = ForgetReport {
+                job: job.clone(),
+                cancelled,
+            };
+            match output::format() {
+                Format::Json => output::emit_result(&report)?,
+                Format::Text => {
+                    if report.cancelled.is_empty() {
+                        println!("no pending deliveries for {job}");
+                    }
+                    for archive in &report.cancelled {
+                        println!("cancelled pending deliveries for {archive}");
+                    }
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Health => {
             let runner = Runner::new(Config::load(&paths.config)?, paths)?;
             let report = health::check(
                 &runner.config,
                 &runner.state,
                 &runner.paths.daemon_lock,
+                &runner.paths.operation_lock,
                 Utc::now(),
             )?;
             match output::format() {
@@ -218,6 +240,12 @@ struct ValidateReport {
 #[derive(Serialize)]
 struct VerifyReport {
     verified: usize,
+}
+
+#[derive(Serialize)]
+struct ForgetReport {
+    job: String,
+    cancelled: Vec<String>,
 }
 
 fn print_status(lines: &[StatusLine]) {
@@ -286,6 +314,9 @@ fn print_health(report: &HealthReport) {
             "not running"
         }
     );
+    if report.busy {
+        println!("a backup, delivery, or restore is running");
+    }
     for job in &report.jobs {
         if job.healthy {
             println!("{}: ok", job.name);

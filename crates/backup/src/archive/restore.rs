@@ -1,16 +1,16 @@
 use std::fs::File;
 use std::io::{Read, Write, copy, sink};
 use std::path::Path;
-use std::process::Command;
 
 use anyhow::{Context, Result};
 use lz4_flex::frame::FrameDecoder;
+use rustix::process::geteuid;
 use tar::Archive;
 
 pub fn restore_archive(archive: &Path, target: &Path) -> Result<()> {
     // Only root can change a file's owner. As a normal user the chown always fails,
     // so restoring ownership would only turn a working restore into a failure.
-    let preserve_ownerships = running_as_root();
+    let preserve_ownerships = geteuid().is_root();
     with_tar_reader(archive, |reader| {
         let mut tar = Archive::new(reader);
         tar.set_overwrite(true);
@@ -21,16 +21,6 @@ pub fn restore_archive(archive: &Path, target: &Path) -> Result<()> {
         tar.unpack(target)
             .with_context(|| format!("restore into {}", target.display()))
     })
-}
-
-fn running_as_root() -> bool {
-    Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .is_some_and(|id| id.trim() == "0")
 }
 
 pub fn verify_archive(archive: &Path) -> Result<()> {

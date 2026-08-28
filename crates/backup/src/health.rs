@@ -12,10 +12,17 @@ use crate::state::State;
 
 const GRACE_SECONDS: i64 = 3600;
 
+// While the operation lock is held, a backup, delivery, or restore is moving
+// data, so a slot or delivery older than one hour is expected, not a fault.
+// The queue is serial, so other jobs are merely waiting behind it. The longer
+// limit still catches an operation that is truly wedged.
+const BUSY_GRACE_SECONDS: i64 = 24 * 3600;
+
 #[derive(Debug, Serialize)]
 pub struct HealthReport {
     pub healthy: bool,
     pub daemon_running: bool,
+    pub busy: bool,
     pub jobs: Vec<JobHealth>,
 }
 
@@ -30,11 +37,17 @@ pub fn check(
     config: &Config,
     state: &State,
     daemon_lock: &Path,
+    operation_lock: &Path,
     now: DateTime<Utc>,
 ) -> Result<HealthReport> {
     let daemon_running = is_locked(daemon_lock)?;
+    let busy = is_locked(operation_lock)?;
     let pending = state.status()?;
-    let grace = Duration::seconds(GRACE_SECONDS);
+    let grace = Duration::seconds(if busy {
+        BUSY_GRACE_SECONDS
+    } else {
+        GRACE_SECONDS
+    });
     let mut jobs = Vec::new();
     for job in &config.jobs {
         let mut problems = Vec::new();
@@ -82,6 +95,7 @@ pub fn check(
     Ok(HealthReport {
         healthy,
         daemon_running,
+        busy,
         jobs,
     })
 }
@@ -117,9 +131,10 @@ mod tests {
         let temporary = tempdir().unwrap();
         let state = State::open(&temporary.path().join("state.redb")).unwrap();
         let lock = temporary.path().join("daemon.lock");
+        let operation = temporary.path().join("operation.lock");
         let now = Utc.with_ymd_and_hms(2026, 8, 28, 12, 0, 0).unwrap();
 
-        let report = check(&config(), &state, &lock, now).unwrap();
+        let report = check(&config(), &state, &lock, &operation, now).unwrap();
 
         assert!(!report.healthy);
         assert!(!report.daemon_running);
@@ -132,11 +147,41 @@ mod tests {
         let temporary = tempdir().unwrap();
         let state = State::open(&temporary.path().join("state.redb")).unwrap();
         let lock = temporary.path().join("daemon.lock");
+        let operation = temporary.path().join("operation.lock");
         let now = Utc.with_ymd_and_hms(2026, 8, 28, 2, 30, 0).unwrap();
 
-        let report = check(&config(), &state, &lock, now).unwrap();
+        let report = check(&config(), &state, &lock, &operation, now).unwrap();
 
         assert!(report.jobs[0].healthy);
+    }
+
+    // A backup that takes hours holds the operation lock the whole time, and a
+    // health check during it must not page anyone. It still must once the run
+    // exceeds the hard busy limit. The monthly cron keeps the latest slot old
+    // enough to age past that limit.
+    #[test]
+    fn a_slow_slot_is_healthy_while_an_operation_runs_but_not_past_the_busy_limit() {
+        let temporary = tempdir().unwrap();
+        let state = State::open(&temporary.path().join("state.redb")).unwrap();
+        let lock = temporary.path().join("daemon.lock");
+        let operation = temporary.path().join("operation.lock");
+        let mut monthly = config();
+        monthly.jobs[0].cron = "0 2 1 * *".to_owned();
+        let held = crate::lock::AppLock::exclusive(&operation).unwrap();
+
+        let during_run = Utc.with_ymd_and_hms(2026, 8, 1, 20, 0, 0).unwrap();
+        let report = check(&monthly, &state, &lock, &operation, during_run).unwrap();
+        assert!(report.busy);
+        assert!(report.jobs[0].healthy);
+
+        let past_limit = Utc.with_ymd_and_hms(2026, 8, 3, 20, 0, 0).unwrap();
+        let report = check(&monthly, &state, &lock, &operation, past_limit).unwrap();
+        assert!(!report.jobs[0].healthy);
+
+        drop(held);
+        let report = check(&monthly, &state, &lock, &operation, during_run).unwrap();
+        assert!(!report.busy);
+        assert!(!report.jobs[0].healthy);
     }
 
     #[test]
@@ -144,11 +189,12 @@ mod tests {
         let temporary = tempdir().unwrap();
         let mut state = State::open(&temporary.path().join("state.redb")).unwrap();
         let lock = temporary.path().join("daemon.lock");
+        let operation = temporary.path().join("operation.lock");
         let now = Utc.with_ymd_and_hms(2026, 8, 28, 12, 0, 0).unwrap();
         let slot = Utc.with_ymd_and_hms(2026, 8, 28, 2, 0, 0).unwrap();
         state.set_last_scheduled("documents", slot).unwrap();
 
-        let report = check(&config(), &state, &lock, now).unwrap();
+        let report = check(&config(), &state, &lock, &operation, now).unwrap();
         assert!(report.jobs[0].healthy);
 
         let job = config().jobs[0].clone();
@@ -162,7 +208,7 @@ mod tests {
         };
         state.register_run(&artifact, &job, true, &[]).unwrap();
 
-        let report = check(&config(), &state, &lock, now).unwrap();
+        let report = check(&config(), &state, &lock, &operation, now).unwrap();
         assert!(!report.jobs[0].healthy);
         assert!(report.jobs[0].problems[0].contains("still pending"));
     }

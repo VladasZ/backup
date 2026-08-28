@@ -369,6 +369,29 @@ impl Runner {
         Ok(())
     }
 
+    // Removes the run rows before the staged files, so a failure in between
+    // leaves an orphaned staged file, which recovery re-registers for a job
+    // still in the configuration, never a delivery row whose archive is gone.
+    pub fn forget(&mut self, job: &str, clear_schedule: bool) -> Result<Vec<String>> {
+        let operation_lock = AppLock::exclusive(&self.paths.operation_lock)?;
+        let forgotten = self.state.forget_job(job, clear_schedule)?;
+        let mut cancelled = Vec::new();
+        for run in forgotten {
+            if run.staged {
+                remove_staged(&run.archive)?;
+                remove_staged(&run.checksum)?;
+            }
+            info!(
+                job,
+                archive = run.archive_name,
+                "cancelled pending deliveries"
+            );
+            cancelled.push(run.archive_name);
+        }
+        drop(operation_lock);
+        Ok(cancelled)
+    }
+
     pub fn purge_history(&mut self) -> Result<()> {
         let purged = self
             .state
@@ -598,6 +621,41 @@ mod tests {
             due[0].artifact.created_at.to_rfc3339(),
             "2026-01-02T03:04:05+00:00"
         );
+    }
+
+    #[test]
+    fn forget_cancels_pending_deliveries_and_removes_the_staged_archive() {
+        let temporary = tempdir().unwrap();
+        let source = source(temporary.path());
+        let good = temporary.path().join("good");
+        let bad = temporary.path().join("bad");
+        fs::write(&bad, "a file where a directory is expected").unwrap();
+        let paths = paths(temporary.path());
+        let staging = paths.staging.clone();
+        let config = Config {
+            jobs: vec![job(
+                &source,
+                vec![Location::Local(good), Location::Local(bad)],
+            )],
+        };
+        let mut runner = Runner::new(config, paths).unwrap();
+        runner.run_named("documents").unwrap();
+        assert_eq!(runner.state.status().unwrap().len(), 1);
+
+        let cancelled = runner.forget("documents", false).unwrap();
+
+        assert_eq!(cancelled.len(), 1);
+        assert!(runner.state.status().unwrap().is_empty());
+        assert!(
+            list_local(&staging.join("documents"), "documents")
+                .unwrap()
+                .is_empty()
+        );
+
+        // The staged file is gone, so recovery cannot resurrect the run.
+        runner.recover_staging().unwrap();
+        assert!(runner.state.status().unwrap().is_empty());
+        assert!(runner.forget("documents", false).unwrap().is_empty());
     }
 
     #[test]

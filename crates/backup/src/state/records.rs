@@ -59,6 +59,14 @@ pub struct PendingDelivery {
 }
 
 #[derive(Clone, Debug)]
+pub struct ForgottenRun {
+    pub archive_name: String,
+    pub archive: PathBuf,
+    pub checksum: PathBuf,
+    pub staged: bool,
+}
+
+#[derive(Clone, Debug)]
 pub struct CompletedRun {
     pub run_id: Uuid,
     pub archive: PathBuf,

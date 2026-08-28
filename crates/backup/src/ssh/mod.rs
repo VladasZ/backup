@@ -9,7 +9,9 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
-use crate::archive::{Artifact, StreamOutcome, Tee, abort_with, verify_checksum, warn_changed};
+use crate::archive::{
+    Artifact, StreamOutcome, Tee, abort_with, create_private, verify_checksum, warn_changed,
+};
 use crate::config::BackupJob;
 use crate::destination::ArchiveInfo;
 use crate::location::SshLocation;
@@ -200,7 +202,7 @@ pub fn fetch_remote(
         }
     };
     let receive_result = (|| {
-        let mut file = File::create(destination)?;
+        let mut file = create_private(destination)?;
         let copied = copy(&mut stream.reader().take(wire.size), &mut file)?;
         file.sync_all()?;
         if copied != wire.size {

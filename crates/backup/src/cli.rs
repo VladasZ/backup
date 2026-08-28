@@ -56,6 +56,9 @@ pub enum Command {
     History {
         job: Option<String>,
     },
+    Forget {
+        job: String,
+    },
     Health,
     Install,
     Uninstall,

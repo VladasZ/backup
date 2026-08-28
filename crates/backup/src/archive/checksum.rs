@@ -6,6 +6,8 @@ use anyhow::{Context, Result, bail};
 use blake3::Hasher;
 use uuid::Uuid;
 
+use super::create_private;
+
 pub struct HashingWriter<W: Write> {
     pub inner: W,
     hasher: Hasher,
@@ -64,8 +66,7 @@ pub fn write_checksum(archive: &Path, checksum: &str) -> Result<PathBuf> {
         checksum_path.display(),
         Uuid::new_v4()
     ));
-    let mut file = File::create(&partial_path)
-        .with_context(|| format!("create {}", partial_path.display()))?;
+    let mut file = create_private(&partial_path)?;
     writeln!(file, "{checksum}  {file_name}")?;
     file.sync_all()?;
     fs::rename(&partial_path, &checksum_path).with_context(|| {

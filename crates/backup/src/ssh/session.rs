@@ -251,7 +251,11 @@ fn ssh_command(remote: &SshLocation) -> Command {
     if let Some(port) = remote.port {
         command.arg("-p").arg(port.to_string());
     }
-    command.arg(remote.target()).args(["backup", "agent"]);
+    // The separator keeps a hostile target string from being read as an ssh option.
+    command
+        .arg("--")
+        .arg(remote.target())
+        .args(["backup", "agent"]);
     command
 }
 
