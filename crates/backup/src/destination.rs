@@ -9,6 +9,7 @@ use tracing::{info, warn};
 use crate::archive::{Artifact, Sink, SinkId, read_checksum, verify_checksum, write_checksum};
 use crate::config::{BackupJob, RetentionConfig};
 use crate::location::Location;
+use crate::retention::milestone_keepers;
 use crate::storage::warn_if_high;
 
 pub struct LocalSink {
@@ -240,7 +241,7 @@ pub fn apply_retention(destination: &Path, job: &BackupJob) -> Result<()> {
         return Ok(());
     };
     let archives = scan_archives(destination, &job.name)?;
-    let removals = retention_removals(&archives, retention)?;
+    let removals = retention_removals(&archives, retention, Utc::now())?;
     for archive in removals {
         let checksum_file = checksum_path(&archive.path);
         fs::remove_file(&archive.path)
@@ -256,20 +257,29 @@ pub fn apply_retention(destination: &Path, job: &BackupJob) -> Result<()> {
     Ok(())
 }
 
+// Milestone keepers, one archive per age bucket, are exempt from the
+// configured rule, so the rule only ever counts and removes the rest.
 fn retention_removals<'archive>(
     archives: &'archive [ArchiveInfo],
     retention: &RetentionConfig,
+    now: DateTime<Utc>,
 ) -> Result<Vec<&'archive ArchiveInfo>> {
+    let created: Vec<_> = archives.iter().map(|archive| archive.created).collect();
+    let keepers = milestone_keepers(&created, now);
+    let candidates = archives
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !keepers.contains(index))
+        .map(|(_, archive)| archive);
     if let Some(count) = retention.count {
-        return Ok(archives.iter().skip(count).collect());
+        return Ok(candidates.skip(count).collect());
     }
     let Some(age) = retention.age_duration()? else {
         return Ok(Vec::new());
     };
     let age = Duration::from_std(age).context("retention age is too large")?;
-    let cutoff = Utc::now() - age;
-    Ok(archives
-        .iter()
+    let cutoff = now - age;
+    Ok(candidates
         .filter(|archive| archive.created < cutoff)
         .collect())
 }
@@ -312,11 +322,12 @@ fn remove_if_present(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::cmp::Reverse;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{Duration as StdDuration, SystemTime};
 
-    use chrono::{Duration, Utc};
+    use chrono::{DateTime, Duration, Utc};
     use tempfile::tempdir;
 
     use super::{
@@ -475,9 +486,63 @@ mod tests {
             count: Some(2),
             age: None,
         };
-        let removals = retention_removals(&archives, &retention).unwrap();
+        let removals = retention_removals(&archives, &retention, Utc::now()).unwrap();
         assert_eq!(removals.len(), 2);
         assert_eq!(removals[0].name, "job-2.tar.lz4");
+    }
+
+    fn aged_archive(days: i64, now: DateTime<Utc>) -> ArchiveInfo {
+        ArchiveInfo {
+            name: format!("job-{days}.tar.lz4"),
+            path: PathBuf::from(format!("job-{days}.tar.lz4")),
+            checksum: None,
+            size: 1,
+            created: now - Duration::days(days),
+        }
+    }
+
+    #[test]
+    fn count_retention_spares_one_keeper_per_age_bucket() {
+        let now = Utc::now();
+        let mut archives: Vec<_> = [0, 1, 2, 8, 10, 20, 40, 100, 400, 800]
+            .into_iter()
+            .map(|days| aged_archive(days, now))
+            .collect();
+        archives.sort_by_key(|archive| Reverse(archive.created));
+        let retention = RetentionConfig {
+            count: Some(2),
+            age: None,
+        };
+
+        let removals = retention_removals(&archives, &retention, now).unwrap();
+
+        // 0 and 1 survive as the newest two. 10, 20, 40, 100, 400, and 800
+        // are the oldest archives of their buckets. Only 2 and 8 go.
+        let mut removed: Vec<_> = removals
+            .iter()
+            .map(|archive| archive.name.clone())
+            .collect();
+        removed.sort();
+        assert_eq!(removed, ["job-2.tar.lz4", "job-8.tar.lz4"]);
+    }
+
+    #[test]
+    fn age_retention_spares_one_keeper_per_age_bucket() {
+        let now = Utc::now();
+        let mut archives: Vec<_> = [0, 8, 10, 400]
+            .into_iter()
+            .map(|days| aged_archive(days, now))
+            .collect();
+        archives.sort_by_key(|archive| Reverse(archive.created));
+        let retention = RetentionConfig {
+            count: None,
+            age: Some("5d".to_owned()),
+        };
+
+        let removals = retention_removals(&archives, &retention, now).unwrap();
+
+        assert_eq!(removals.len(), 1);
+        assert_eq!(removals[0].name, "job-8.tar.lz4");
     }
 
     #[test]

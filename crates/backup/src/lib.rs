@@ -12,6 +12,7 @@ pub mod logs;
 pub mod operations;
 pub mod paths;
 pub mod protocol;
+pub mod retention;
 pub mod runner;
 pub mod service;
 pub mod ssh;

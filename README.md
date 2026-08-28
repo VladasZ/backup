@@ -17,6 +17,7 @@ nothing else to choose.
 - Full TAR archives with UTC timestamps and UUIDs.
 - LZ4 compressed TAR archives, readable by the standard `lz4` tool.
 - Infinite retention by default, with optional count or age retention.
+- Milestone archives of week, month, and year ages that are always kept.
 - Streaming delivery to every destination at once, no full local copy needed.
 - Staged copy and destination-specific retries when a destination fails.
 - Atomic publication and BLAKE3 checksum files.
@@ -219,6 +220,17 @@ retention = { age = "90d" }
 
 Age values use durations such as `12h`, `7d`, or `6w`. Count and age are
 mutually exclusive. Omit `retention` to keep archives forever.
+
+Besides the archives the count or age rule keeps, every job always keeps one
+milestone archive per age bucket: 1 to 2 weeks, 2 weeks to 1 month, 1 to 2
+months, 2 to 3 months, 3 to 6 months, 6 months to 1 year, and then one per
+year forever. The oldest archive in each bucket is kept, so it slides into the
+next bucket as it ages and there is always a backup of each approximate age.
+Milestone archives are never removed by the count or age rule, and the rule
+counts only the remaining archives. There is no setting for this. A month is
+30 days and a year is 365 days, measured from the timestamp in the archive
+name. Jobs without a retention rule are unaffected, since they never delete
+anything.
 
 ### Exclusions
 
