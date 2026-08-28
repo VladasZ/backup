@@ -66,7 +66,7 @@ pub struct CompletedRun {
     pub staged: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct StatusLine {
     pub job: String,
     pub archive: String,
@@ -74,7 +74,7 @@ pub struct StatusLine {
     pub pending_destinations: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct HistoryLine {
     pub job: String,
     pub archive: String,

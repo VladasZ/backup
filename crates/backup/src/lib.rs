@@ -5,11 +5,13 @@ pub mod cli;
 pub mod config;
 pub mod daemon;
 pub mod destination;
+pub mod health;
 pub mod location;
 pub mod lock;
 pub mod logging;
 pub mod logs;
 pub mod operations;
+pub mod output;
 pub mod paths;
 pub mod protocol;
 pub mod retention;
@@ -20,8 +22,8 @@ pub mod state;
 pub mod storage;
 pub mod transport;
 
-use anyhow::Result;
+use std::process::ExitCode;
 
-pub fn run() -> Result<()> {
+pub fn run() -> ExitCode {
     app::run()
 }

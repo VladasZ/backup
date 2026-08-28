@@ -4,6 +4,8 @@ use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Utc};
+use serde::Serialize;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -14,6 +16,7 @@ use crate::archive::{
 use crate::config::{BackupJob, Config};
 use crate::destination::{ArchiveInfo, apply_retention, list_local};
 use crate::location::{Location, SshLocation};
+use crate::output::{Event, emit};
 use crate::paths::AppPaths;
 use crate::ssh::{
     fetch_remote, list_remote, prune_remote, restore_remote, validate_agent, validate_destination,
@@ -52,27 +55,45 @@ pub fn validate(config: &Config) -> Result<()> {
     Ok(())
 }
 
-pub fn list(job: &BackupJob) -> Result<()> {
-    let archives = list_archives(job)?;
-    if archives.is_empty() {
-        println!("no archives found for {}", job.name);
-        return Ok(());
+#[derive(Debug, Serialize)]
+pub struct ArchiveEntry {
+    pub job: String,
+    pub destination: String,
+    pub name: String,
+    pub size: u64,
+    pub created: DateTime<Utc>,
+    pub checksum_missing: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RestoreReport {
+    pub archive: String,
+    pub target: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PruneEntry {
+    pub job: String,
+    pub destination: String,
+}
+
+pub fn list(config: &Config, job_name: Option<&str>) -> Result<Vec<ArchiveEntry>> {
+    let jobs: Vec<_> = match job_name {
+        Some(name) => vec![config.job(name)?],
+        None => config.jobs.iter().collect(),
+    };
+    let mut entries = Vec::new();
+    for job in jobs {
+        entries.extend(list_archives(job)?.into_iter().map(|located| ArchiveEntry {
+            job: job.name.clone(),
+            destination: located.destination.to_string(),
+            checksum_missing: located.archive.checksum.is_none(),
+            name: located.archive.name,
+            size: located.archive.size,
+            created: located.archive.created,
+        }));
     }
-    for located in archives {
-        let note = if located.archive.checksum.is_none() {
-            "  (checksum file missing)"
-        } else {
-            ""
-        };
-        println!(
-            "{}  {:>12}  {}  {}{note}",
-            located.archive.created.to_rfc3339(),
-            located.archive.size,
-            located.destination,
-            located.archive.name
-        );
-    }
-    Ok(())
+    Ok(entries)
 }
 
 pub fn restore(
@@ -81,17 +102,21 @@ pub fn restore(
     target: &Location,
     yes: bool,
     paths: &AppPaths,
-) -> Result<()> {
+) -> Result<Option<RestoreReport>> {
     let candidates = select_archives(job, archive_name)?;
     if !yes && !confirm_restore(target)? {
         println!("restore cancelled");
-        return Ok(());
+        return Ok(None);
     }
     let mut failures = Vec::new();
     for located in candidates {
         let checksum = match resolve_checksum(&located, yes)? {
             Some(checksum) => checksum,
             None => {
+                emit(&Event::RestoreCopyRejected {
+                    destination: located.destination.to_string(),
+                    error: "checksum file missing".to_owned(),
+                });
                 failures.push(format!("{}: checksum file missing", located.destination));
                 continue;
             }
@@ -104,6 +129,10 @@ pub fn restore(
                     %error,
                     "could not read archive copy"
                 );
+                emit(&Event::RestoreCopyRejected {
+                    destination: located.destination.to_string(),
+                    error: format!("{error:#}"),
+                });
                 failures.push(format!("{}: {error:#}", located.destination));
                 continue;
             }
@@ -119,6 +148,10 @@ pub fn restore(
                 %error,
                 "archive copy failed verification"
             );
+            emit(&Event::RestoreCopyRejected {
+                destination: located.destination.to_string(),
+                error: format!("{error:#}"),
+            });
             failures.push(format!("{}: {error:#}", located.destination));
             continue;
         }
@@ -130,8 +163,14 @@ pub fn restore(
             remove_temporary(&artifact);
         }
         result?;
-        println!("restored {} to {}", located.archive.name, target);
-        return Ok(());
+        emit(&Event::Restored {
+            archive: located.archive.name.clone(),
+            target: target.to_string(),
+        });
+        return Ok(Some(RestoreReport {
+            archive: located.archive.name,
+            target: target.to_string(),
+        }));
     }
     bail!(
         "every copy of archive {archive_name:?} failed: {}",
@@ -139,7 +178,11 @@ pub fn restore(
     )
 }
 
-pub fn verify(config: &Config, job_name: Option<&str>, archive_name: Option<&str>) -> Result<()> {
+pub fn verify(
+    config: &Config,
+    job_name: Option<&str>,
+    archive_name: Option<&str>,
+) -> Result<usize> {
     let jobs: Vec<_> = match job_name {
         Some(name) => vec![config.job(name)?],
         None => config.jobs.iter().collect(),
@@ -147,16 +190,26 @@ pub fn verify(config: &Config, job_name: Option<&str>, archive_name: Option<&str
     let mut verified = 0usize;
     let mut failures = Vec::new();
     for job in jobs {
-        for located in list_archives(job)? {
-            if archive_name.is_some_and(|name| name != located.archive.name) {
+        let archives = list_archives(job)?;
+        // "latest" resolves per job, since the archives are listed newest first.
+        let wanted = match archive_name {
+            Some("latest") => archives.first().map(|located| located.archive.name.clone()),
+            Some(name) => Some(name.to_owned()),
+            None => None,
+        };
+        for located in archives {
+            if wanted
+                .as_deref()
+                .is_some_and(|name| name != located.archive.name)
+            {
                 continue;
             }
             match verify_one(&located) {
                 Ok(()) => {
-                    println!(
-                        "verified {} at {}",
-                        located.archive.name, located.destination
-                    );
+                    emit(&Event::Verified {
+                        archive: located.archive.name.clone(),
+                        destination: located.destination.to_string(),
+                    });
                     verified += 1;
                 }
                 Err(error) => {
@@ -166,6 +219,11 @@ pub fn verify(config: &Config, job_name: Option<&str>, archive_name: Option<&str
                         %error,
                         "archive verification failed"
                     );
+                    emit(&Event::VerifyFailed {
+                        archive: located.archive.name.clone(),
+                        destination: located.destination.to_string(),
+                        error: format!("{error:#}"),
+                    });
                     failures.push(format!(
                         "{} at {}: {error:#}",
                         located.archive.name, located.destination
@@ -184,7 +242,7 @@ pub fn verify(config: &Config, job_name: Option<&str>, archive_name: Option<&str
     if verified == 0 {
         bail!("no matching archives found");
     }
-    Ok(())
+    Ok(verified)
 }
 
 fn verify_one(located: &LocatedArchive) -> Result<()> {
@@ -202,21 +260,25 @@ fn verify_one(located: &LocatedArchive) -> Result<()> {
     }
 }
 
-pub fn prune(config: &Config, job_name: Option<&str>) -> Result<()> {
+pub fn prune(config: &Config, job_name: Option<&str>) -> Result<Vec<PruneEntry>> {
     let jobs: Vec<_> = match job_name {
         Some(name) => vec![config.job(name)?],
         None => config.jobs.iter().collect(),
     };
+    let mut pruned = Vec::new();
     for job in jobs {
         for destination in &job.destinations {
             match destination {
                 Location::Local(path) => apply_retention(path, job)?,
                 Location::Ssh(remote) => prune_remote(remote, job)?,
             }
-            println!("pruned {} at {}", job.name, destination);
+            pruned.push(PruneEntry {
+                job: job.name.clone(),
+                destination: destination.to_string(),
+            });
         }
     }
-    Ok(())
+    Ok(pruned)
 }
 
 fn validate_local_source(source: &Path) -> Result<()> {
@@ -421,12 +483,47 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::restore;
+    use super::{restore, verify};
     use crate::archive::create_local_archive;
-    use crate::config::BackupJob;
+    use crate::config::{BackupJob, Config};
     use crate::destination::deliver_local;
     use crate::location::Location;
     use crate::paths::AppPaths;
+
+    #[test]
+    fn verify_latest_checks_only_the_newest_archive() {
+        let temporary = tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let staging = temporary.path().join("staging");
+        let destination = temporary.path().join("destination");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("file.txt"), "content").unwrap();
+        let job = BackupJob {
+            name: "docs".to_owned(),
+            source: Location::Local(source.clone()),
+            destinations: vec![Location::Local(destination.clone())],
+            cron: "0 2 * * *".to_owned(),
+            retention: None,
+            exclude: Vec::new(),
+        };
+
+        let mut old = create_local_archive(&job, &source, &staging).unwrap();
+        let old_name = "docs-2026-01-01T00:00:00Z-00000000-0000-0000-0000-000000000000.tar.lz4";
+        let old_path = staging.join(old_name);
+        fs::rename(&old.path, &old_path).unwrap();
+        old.name = old_name.to_owned();
+        old.path = old_path;
+        deliver_local(&old, &destination, &job).unwrap();
+
+        let fresh = create_local_archive(&job, &source, &staging).unwrap();
+        deliver_local(&fresh, &destination, &job).unwrap();
+
+        fs::write(destination.join(old_name), "corrupt").unwrap();
+        let config = Config { jobs: vec![job] };
+
+        assert_eq!(verify(&config, Some("docs"), Some("latest")).unwrap(), 1);
+        assert!(verify(&config, Some("docs"), None).is_err());
+    }
 
     #[test]
     fn restore_falls_back_to_another_destination_when_a_copy_is_corrupt() {

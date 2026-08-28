@@ -1,11 +1,10 @@
 mod session;
 mod sink;
+mod stall;
 
 use std::fs::{self, File};
-use std::io::{BufReader, ErrorKind, Read, copy};
+use std::io::{ErrorKind, Read, copy};
 use std::path::Path;
-use std::process::{Child, ChildStdout};
-use std::thread::JoinHandle;
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
@@ -19,7 +18,7 @@ use crate::protocol::{
     WireArtifact, copy_frames,
 };
 
-use session::{Session, join_stderr, read_response, simple_request, spawn_stream, terminate};
+use session::{Session, SshStream, read_response, simple_request};
 pub use sink::SshSink;
 
 const SEND_CHUNK: usize = 1024 * 1024;
@@ -59,9 +58,7 @@ pub fn validate_destination(remote: &SshLocation) -> Result<()> {
 
 pub struct RemoteStream {
     job: String,
-    child: Child,
-    output: BufReader<ChildStdout>,
-    stderr: JoinHandle<Result<String>>,
+    stream: SshStream,
     pub header: StreamHeader,
 }
 
@@ -72,41 +69,46 @@ impl RemoteStream {
             source: remote.path.clone(),
             exclude: job.exclude.clone(),
         };
-        let (mut child, mut output, stderr) = spawn_stream(remote, &request)?;
-        let header: StreamHeader = match read_response(&mut output) {
+        let mut stream = SshStream::spawn(remote, &request)?;
+        let header: StreamHeader = match read_response(&mut stream.reader()) {
             Ok(header) => header,
             Err(error) => {
-                terminate(&mut child)?;
-                let stderr = join_stderr(stderr)?;
-                bail!("read remote archive response: {error:#}; SSH stderr: {stderr}");
+                stream.terminate()?;
+                bail!(
+                    "read remote archive response: {error:#}; {}",
+                    stream.failure_detail()?
+                );
             }
         };
         Ok(Self {
             job: job.name.clone(),
-            child,
-            output,
-            stderr,
+            stream,
             header,
         })
     }
 
     pub fn pump(mut self, mut tee: Tee) -> Result<StreamOutcome> {
-        let received = copy_frames(&mut self.output, &mut tee)
-            .and_then(|_| read_response::<StreamTrailer>(&mut self.output));
+        let copied = copy_frames(&mut self.stream.reader(), &mut tee);
+        let received =
+            copied.and_then(|_| read_response::<StreamTrailer>(&mut self.stream.reader()));
         let trailer = match received {
             Ok(trailer) => trailer,
             Err(error) => {
                 let error = abort_with(tee, error);
-                terminate(&mut self.child)?;
-                let stderr = join_stderr(self.stderr)?;
-                bail!("receive remote archive: {error:#}; SSH stderr: {stderr}");
+                self.stream.terminate()?;
+                bail!(
+                    "receive remote archive: {error:#}; {}",
+                    self.stream.failure_detail()?
+                );
             }
         };
-        let status = self.child.wait()?;
-        let stderr = join_stderr(self.stderr)?;
+        let status = self.stream.wait()?;
         if !status.success() {
             tee.abort();
-            bail!("remote archive command failed: {stderr}");
+            bail!(
+                "remote archive command failed: {}",
+                self.stream.failure_detail()?
+            );
         }
         let checksum = tee.checksum();
         let size = tee.size();
@@ -186,18 +188,20 @@ pub fn fetch_remote(
         archive: archive.to_path_buf(),
         checksum: checksum.to_owned(),
     };
-    let (mut child, mut output, stderr) = spawn_stream(remote, &request)?;
-    let wire: WireArtifact = match read_response(&mut output) {
+    let mut stream = SshStream::spawn(remote, &request)?;
+    let wire: WireArtifact = match read_response(&mut stream.reader()) {
         Ok(wire) => wire,
         Err(error) => {
-            terminate(&mut child)?;
-            let stderr = join_stderr(stderr)?;
-            bail!("read remote download response: {error:#}; SSH stderr: {stderr}");
+            stream.terminate()?;
+            bail!(
+                "read remote download response: {error:#}; {}",
+                stream.failure_detail()?
+            );
         }
     };
     let receive_result = (|| {
         let mut file = File::create(destination)?;
-        let copied = copy(&mut output.by_ref().take(wire.size), &mut file)?;
+        let copied = copy(&mut stream.reader().take(wire.size), &mut file)?;
         file.sync_all()?;
         if copied != wire.size {
             bail!("downloaded {copied} bytes, expected {}", wire.size);
@@ -205,16 +209,20 @@ pub fn fetch_remote(
         verify_checksum(destination, &wire.checksum)
     })();
     if let Err(error) = receive_result {
-        terminate(&mut child)?;
-        let stderr = join_stderr(stderr)?;
+        stream.terminate()?;
         remove_if_present(destination)?;
-        bail!("download remote archive: {error:#}; SSH stderr: {stderr}");
+        bail!(
+            "download remote archive: {error:#}; {}",
+            stream.failure_detail()?
+        );
     }
-    let status = child.wait()?;
-    let stderr = join_stderr(stderr)?;
+    let status = stream.wait()?;
     if !status.success() {
         remove_if_present(destination)?;
-        bail!("remote archive download failed: {stderr}");
+        bail!(
+            "remote archive download failed: {}",
+            stream.failure_detail()?
+        );
     }
     Ok(())
 }

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
@@ -17,6 +19,7 @@ use crate::state::BackupRetry;
 const LOOP_INTERVAL: Duration = Duration::from_secs(1);
 const DELIVERY_RECHECK_SECONDS: i64 = 60;
 const PURGE_INTERVAL_HOURS: i64 = 1;
+const STATE_ERROR_RETRY_SECONDS: i64 = 60;
 
 pub fn run(config: Config, paths: AppPaths) -> Result<()> {
     let daemon_lock = AppLock::try_exclusive(
@@ -43,6 +46,8 @@ pub fn run(config: Config, paths: AppPaths) -> Result<()> {
     info!(config = %runner.paths.config.display(), "backup daemon started");
     let mut next_delivery_check = Utc::now();
     let mut last_purge: Option<DateTime<Utc>> = None;
+    let mut jobs_retry_at: Option<DateTime<Utc>> = None;
+    let mut schedule_cache: HashMap<String, JobSchedule> = HashMap::new();
     while !stopping.load(Ordering::SeqCst) {
         let now = Utc::now();
         if last_purge.is_none_or(|last| now - last >= ChronoDuration::hours(PURGE_INTERVAL_HOURS)) {
@@ -55,13 +60,23 @@ pub fn run(config: Config, paths: AppPaths) -> Result<()> {
             if let Err(error) = runner.process_due_deliveries_until(Some(&stopping)) {
                 error!(%error, "failed to process pending deliveries");
             }
-            next_delivery_check = next_check(&runner)?;
+            next_delivery_check = next_check(&runner);
         }
         if stopping.load(Ordering::SeqCst) {
             break;
         }
-        if run_due_jobs(&mut runner, &stopping)? {
-            next_delivery_check = next_check(&runner)?;
+        if jobs_retry_at.is_none_or(|at| now >= at) {
+            match run_due_jobs(&mut runner, &stopping, &mut schedule_cache) {
+                Ok(true) => next_delivery_check = next_check(&runner),
+                Ok(false) => {}
+                // A state database error must not kill the daemon. The pause
+                // keeps a persistent error from rerunning a backup every tick.
+                Err(error) => {
+                    error!(%error, "failed to run scheduled backups; retrying in a minute");
+                    jobs_retry_at =
+                        Some(Utc::now() + ChronoDuration::seconds(STATE_ERROR_RETRY_SECONDS));
+                }
+            }
         }
 
         match receiver.recv_timeout(LOOP_INTERVAL) {
@@ -89,15 +104,29 @@ pub fn run(config: Config, paths: AppPaths) -> Result<()> {
 
 // Other processes such as `backup run` can add pending deliveries at any time, so an idle
 // daemon still looks again after a minute even when its own state showed nothing due.
-fn next_check(runner: &Runner) -> Result<DateTime<Utc>> {
+fn next_check(runner: &Runner) -> DateTime<Utc> {
     let fallback = Utc::now() + ChronoDuration::seconds(DELIVERY_RECHECK_SECONDS);
-    Ok(runner
-        .state
-        .next_due()?
-        .map_or(fallback, |due| due.min(fallback)))
+    match runner.state.next_due() {
+        Ok(due) => due.map_or(fallback, |due| due.min(fallback)),
+        Err(error) => {
+            error!(%error, "failed to read the next delivery time");
+            fallback
+        }
+    }
 }
 
-fn run_due_jobs(runner: &mut Runner, stopping: &AtomicBool) -> Result<bool> {
+// The daemon is the only writer of schedules and backup retries, so both are
+// cached and idle ticks never open the state database.
+struct JobSchedule {
+    last: Option<DateTime<Utc>>,
+    retry: Option<BackupRetry>,
+}
+
+fn run_due_jobs(
+    runner: &mut Runner,
+    stopping: &AtomicBool,
+    cache: &mut HashMap<String, JobSchedule>,
+) -> Result<bool> {
     let now = Utc::now();
     let mut ran = false;
     let jobs = runner.config.jobs.clone();
@@ -105,28 +134,41 @@ fn run_due_jobs(runner: &mut Runner, stopping: &AtomicBool) -> Result<bool> {
         if stopping.load(Ordering::SeqCst) {
             break;
         }
-        let last = runner.state.last_scheduled(&job.name)?;
-        let unhandled = unhandled_slot(&job, last, now)?;
-        let retry = runner.state.backup_retry(&job.name)?;
-        let Some(slot) = due_backup(unhandled, retry, now) else {
+        let schedule = match cache.entry(job.name.clone()) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(JobSchedule {
+                last: runner.state.last_scheduled(&job.name)?,
+                retry: runner.state.backup_retry(&job.name)?,
+            }),
+        };
+        let unhandled = unhandled_slot(&job, schedule.last, now)?;
+        let Some(slot) = due_backup(unhandled, schedule.retry, now) else {
             continue;
         };
 
         info!(job = job.name, scheduled_at = %slot, "queueing scheduled backup");
         ran = true;
         match runner.run_job(&job) {
-            Ok(()) => {
+            Ok(_) => {
                 runner.state.set_last_scheduled(&job.name, slot)?;
                 runner.state.clear_backup_retry(&job.name)?;
+                schedule.last = Some(slot);
+                schedule.retry = None;
             }
             Err(error) => {
-                let previous_attempts = retry
+                let previous_attempts = schedule
+                    .retry
                     .filter(|retry| retry.slot == slot)
                     .map_or(0, |retry| retry.attempts);
                 let retry_at =
                     runner
                         .state
                         .record_backup_failure(&job.name, slot, previous_attempts)?;
+                schedule.retry = Some(BackupRetry {
+                    slot,
+                    attempts: previous_attempts + 1,
+                    next_retry: retry_at,
+                });
                 error!(job = job.name, %error, retry_at = %retry_at, "scheduled backup failed; will retry");
             }
         }
@@ -149,7 +191,7 @@ fn due_backup(
     Some(slot)
 }
 
-fn unhandled_slot(
+pub(crate) fn unhandled_slot(
     job: &BackupJob,
     last: Option<DateTime<Utc>>,
     now: DateTime<Utc>,

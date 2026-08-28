@@ -25,6 +25,7 @@ nothing else to choose.
 - Symbolic links, hard links, metadata, ownership, and extended attributes.
 - Sockets, FIFOs, device files, and unreadable entries are skipped with a warning.
 - Thirty days of completed run history.
+- A health command for monitoring and a JSON mode for GUI integrations.
 - Gitignore-style exclusions configured per job.
 - Automatic configuration reload.
 - Rotating log files.
@@ -169,6 +170,10 @@ as `backup` in its non-interactive SSH `PATH`. The controller invokes the
 hidden `backup agent` command. A remote host does not need a configuration just
 to act as an agent.
 
+Every agent response carries the protocol version, so a remote running an
+incompatible backup binary fails any command with a clear error, not only
+`backup validate`.
+
 Test the remote setup before installing the service:
 
 ```sh
@@ -297,6 +302,23 @@ launchctl print "gui/$(id -u)/com.vladas.backup" # macOS
 systemctl --user status backup.service           # Linux
 ```
 
+### Check health
+
+```sh
+backup health
+```
+
+Health exits with code 0 when everything is fine and 1 otherwise, so a cron
+job or monitor can watch it. It reports a problem when the daemon is not
+running, when a job's latest scheduled slot has not completed within one hour,
+when a delivery has been pending for over one hour, or when a job that is no
+longer in the configuration still has pending deliveries. There is no setting
+for the grace period.
+
+Only the daemon marks scheduled slots as handled, so a machine that never runs
+the daemon reports its slots as missed. Health is a check on the scheduled
+service, not on manual runs.
+
 ### Read logs
 
 ```sh
@@ -309,10 +331,12 @@ Logs are printed oldest first. Follow mode continues across rotation.
 ### List archives
 
 ```sh
+backup list
 backup list documents
 ```
 
-Output includes timestamp, byte size, destination, and archive name. An
+Without a job name, archives of every configured job are listed. Output
+includes timestamp, byte size, destination, and archive name. An
 unavailable destination is logged without hiding archives at healthy
 destinations.
 
@@ -360,10 +384,12 @@ running as root, since only root may change a file's owner.
 backup verify
 backup verify documents
 backup verify documents --archive ARCHIVE_NAME
+backup verify documents --archive latest
 ```
 
 Verification checks BLAKE3 and reads every TAR entry through the selected
-decompressor, locally or through the remote agent.
+decompressor, locally or through the remote agent. `--archive latest` checks
+only the newest archive, resolved per job.
 
 ### Apply retention now
 
@@ -382,6 +408,40 @@ backup daemon
 ```
 
 SIGINT and SIGTERM stop new work and let the current backup or delivery finish.
+
+### JSON output
+
+Every command except `daemon`, `agent`, `logs`, `install`, and `uninstall`
+accepts a global `--json` flag for integration with GUI applications and
+scripts. All JSON goes to stdout, one object per line. Log lines stay on
+stderr.
+
+The final line of every `--json` command is a result envelope:
+
+```json
+{"ok":true,"error":null,"data":{...}}
+{"ok":false,"error":"unknown backup job \"missing\"","data":null}
+```
+
+Exit codes are unchanged, so `ok` mirrors the exit status. `status`,
+`history`, and `list` return arrays in `data`. `health` returns the health
+report in `data` and still exits with 1 when unhealthy.
+
+`run`, `verify`, and `restore` stream progress events before the final
+envelope, one JSON object per line with an `event` field:
+
+```json
+{"event":"backup_started","job":"documents","archive":"documents-...tar.lz4"}
+{"event":"progress","bytes":67108864}
+{"event":"destination_completed","destination":"/mnt/backup/documents"}
+{"event":"verified","archive":"documents-...tar.lz4","destination":"/mnt/backup/documents"}
+{"event":"restored","archive":"documents-...tar.lz4","target":"/tmp/restored"}
+```
+
+Progress events appear roughly every 64 MiB of archive data. Unknown event
+types may be added later, so a consumer should ignore events it does not
+recognize. Restore prompts cannot be answered in JSON mode, so
+`restore --json` requires `--yes`.
 
 ### Install or remove the service
 
@@ -457,6 +517,16 @@ Destinations are independent. Failed destinations retry indefinitely:
 Successful destinations are not sent the same archive again. A corrupt
 destination copy is replaced from staging, and a bad checksum file is
 repaired after the archive itself is verified.
+
+A remote that accepts the SSH connection but then stops making progress cannot
+stall the queue. When no data moves for 15 minutes during an archive transfer,
+the connection is terminated, that destination is marked failed, and the normal
+retry schedule applies. There is no setting for this.
+
+An interrupted transfer can leave a hidden partial file behind. Partial files
+older than one day are deleted automatically during later deliveries and at
+daemon startup. A transfer that is still running is never touched, since its
+partial file keeps a fresh modification time.
 
 Removing a job from the configuration does not cancel its recorded pending
 deliveries.

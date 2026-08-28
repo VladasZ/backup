@@ -13,7 +13,7 @@ croner = { workspace = true }
 ctrlc = { workspace = true, features = ["termination"] }
 directories = { workspace = true }
 file-rotate = { workspace = true }
-fs2 = { workspace = true }
+fs4 = { workspace = true }
 humantime = { workspace = true }
 ignore = { workspace = true }
 lz4_flex = { workspace = true }

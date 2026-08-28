@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
 
 use super::checksum::write_checksum;
 use super::stream::{Sink, SinkId};
+use crate::storage::warn_if_high;
 
 pub struct StagingSink {
     partial: PathBuf,
@@ -17,6 +18,7 @@ impl StagingSink {
     pub fn open(staging: &Path, name: &str) -> Result<Box<dyn Sink>> {
         fs::create_dir_all(staging)
             .with_context(|| format!("create staging directory {}", staging.display()))?;
+        warn_if_high(staging, "staging")?;
         let partial = staging.join(format!(".{name}.partial"));
         remove_if_present(&partial)?;
         let file =

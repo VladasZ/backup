@@ -78,6 +78,11 @@ impl State {
                     .iter()
                     .find(|result| result.destination == *destination)
                     .map_or(DeliveryStatus::Pending, |result| result.status.clone());
+                // A failed destination with no staged copy cannot be redelivered,
+                // so it gets no delivery row. The scheduler retries the slot.
+                if !staged && matches!(status, DeliveryStatus::Failed(_)) {
+                    continue;
+                }
                 let delivery = match status {
                     DeliveryStatus::Delivered => DeliveryRecord {
                         delivered: true,

@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use anyhow::Result;
-use fs2::{available_space, total_space};
+use fs4::{available_space, total_space};
 use tracing::warn;
 
 const WARNING_PERCENT: u64 = 80;

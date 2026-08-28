@@ -21,7 +21,7 @@ impl SshSink {
             destination: remote.path.clone(),
             job: job.clone(),
         };
-        let session = Session::start(remote, &request)?;
+        let session = Session::start_watched(remote, &request)?;
         Ok(Box::new(Self {
             remote: remote.clone(),
             session,
@@ -36,7 +36,9 @@ impl Sink for SshSink {
 
     fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
         let stdin = self.session.stdin().map_err(io::Error::other)?;
-        write_frame(stdin, bytes)
+        write_frame(stdin, bytes)?;
+        self.session.bump();
+        Ok(())
     }
 
     fn finish(mut self: Box<Self>, checksum: &str, size: u64) -> Result<()> {

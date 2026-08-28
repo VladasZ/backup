@@ -1,9 +1,7 @@
-use std::fs::{File, OpenOptions};
-use std::io::ErrorKind;
+use std::fs::{File, OpenOptions, TryLockError};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use fs2::FileExt;
 
 pub struct AppLock {
     file: File,
@@ -12,7 +10,7 @@ pub struct AppLock {
 impl AppLock {
     pub fn exclusive(path: &Path) -> Result<Self> {
         let file = open(path)?;
-        file.lock_exclusive()
+        file.lock()
             .with_context(|| format!("lock {}", path.display()))?;
         Ok(Self { file })
     }
@@ -26,17 +24,32 @@ impl AppLock {
 
     pub fn try_exclusive(path: &Path, conflict: &str) -> Result<Self> {
         let file = open(path)?;
-        match file.try_lock_exclusive() {
+        match file.try_lock() {
             Ok(()) => Ok(Self { file }),
-            Err(error) if error.kind() == ErrorKind::WouldBlock => bail!("{conflict}"),
-            Err(error) => Err(error).with_context(|| format!("lock {}", path.display())),
+            Err(TryLockError::WouldBlock) => bail!("{conflict}"),
+            Err(TryLockError::Error(error)) => {
+                Err(error).with_context(|| format!("lock {}", path.display()))
+            }
+        }
+    }
+}
+
+// The probe briefly holds the lock itself, so a daemon starting at that exact
+// moment can fail to acquire it. Health checks run rarely, the window is tiny.
+pub fn is_locked(path: &Path) -> Result<bool> {
+    let file = open(path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(false),
+        Err(TryLockError::WouldBlock) => Ok(true),
+        Err(TryLockError::Error(error)) => {
+            Err(error).with_context(|| format!("probe lock {}", path.display()))
         }
     }
 }
 
 impl Drop for AppLock {
     fn drop(&mut self) {
-        if let Err(error) = FileExt::unlock(&self.file) {
+        if let Err(error) = self.file.unlock() {
             tracing::error!(%error, "failed to release application lock");
         }
     }

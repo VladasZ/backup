@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail};
 use chrono::{Duration, Utc};
+use serde::Serialize;
 use tracing::{error, info, warn};
 
 use crate::archive::{
@@ -12,16 +13,30 @@ use crate::archive::{
     pump_local, read_checksum, verify_archive, verify_checksum, write_checksum,
 };
 use crate::config::{BackupJob, Config};
-use crate::destination::{LocalSink, belongs_to_job, checksum_path};
+use crate::destination::{
+    LocalSink, belongs_to_job, checksum_path, parse_archive_name, sweep_stale_partials,
+};
 use crate::location::Location;
 use crate::lock::AppLock;
+use crate::output::{Event, emit};
 use crate::paths::AppPaths;
 use crate::ssh::{RemoteStream, SshSink};
 use crate::state::{DeliveryResult, DeliveryStatus, PendingDelivery, State};
 use crate::storage::warn_if_high;
 use crate::transport::deliver;
 
-const HISTORY_DAYS: i64 = 30;
+pub(crate) const HISTORY_DAYS: i64 = 30;
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RunReport {
+    pub job: String,
+    pub archive: String,
+    pub size: u64,
+    pub checksum: String,
+    pub delivered: usize,
+    pub failed: usize,
+    pub staged: bool,
+}
 
 pub struct Runner {
     pub config: Config,
@@ -45,7 +60,7 @@ impl Runner {
         })
     }
 
-    pub fn run_named(&mut self, name: &str) -> Result<()> {
+    pub fn run_named(&mut self, name: &str) -> Result<RunReport> {
         self.recover_staging()?;
         let job = self.config.job(name)?.clone();
         self.run_job(&job)
@@ -61,14 +76,14 @@ impl Runner {
         Ok(())
     }
 
-    pub fn run_job(&mut self, job: &BackupJob) -> Result<()> {
+    pub fn run_job(&mut self, job: &BackupJob) -> Result<RunReport> {
         let operation_lock = AppLock::exclusive(&self.paths.operation_lock)?;
         let result = self.run_job_locked(job);
         drop(operation_lock);
         result
     }
 
-    fn run_job_locked(&mut self, job: &BackupJob) -> Result<()> {
+    fn run_job_locked(&mut self, job: &BackupJob) -> Result<RunReport> {
         info!(job = job.name, source = %job.source, "starting backup");
         let started = Utc::now();
         let (name, created_at, producer) = match &job.source {
@@ -91,6 +106,10 @@ impl Runner {
             }
         };
 
+        emit(&Event::BackupStarted {
+            job: job.name.clone(),
+            archive: name.clone(),
+        });
         let mut results = Vec::new();
         let mut sinks = Vec::new();
         for destination in &job.destinations {
@@ -130,13 +149,13 @@ impl Runner {
             Producer::Local(scanner) => pump_local(job, &scanner, Tee::new(sinks))?,
             Producer::Remote(stream) => stream.pump(Tee::new(sinks))?,
         };
-        let staged = self.record_outcome(job, &name, created_at, outcome, results, &staging)?;
-        if staged {
+        let report = self.record_outcome(job, &name, created_at, outcome, results, &staging)?;
+        if report.staged {
             self.cleanup_completed()?;
         } else {
             self.complete_unstaged()?;
         }
-        Ok(())
+        Ok(report)
     }
 
     fn record_outcome(
@@ -147,7 +166,7 @@ impl Runner {
         outcome: StreamOutcome,
         mut results: Vec<DeliveryResult>,
         staging: &Path,
-    ) -> Result<bool> {
+    ) -> Result<RunReport> {
         let mut staged = false;
         for sink in outcome.sinks {
             match sink.id {
@@ -170,29 +189,34 @@ impl Runner {
             .count();
         for result in &results {
             match &result.status {
-                DeliveryStatus::Delivered => info!(
-                    job = job.name,
-                    destination = %result.destination,
-                    archive = name,
-                    "destination completed"
-                ),
-                DeliveryStatus::Failed(error) => error!(
-                    job = job.name,
-                    destination = %result.destination,
-                    archive = name,
-                    %error,
-                    "destination failed"
-                ),
+                DeliveryStatus::Delivered => {
+                    info!(
+                        job = job.name,
+                        destination = %result.destination,
+                        archive = name,
+                        "destination completed"
+                    );
+                    emit(&Event::DestinationCompleted {
+                        destination: result.destination.to_string(),
+                    });
+                }
+                DeliveryStatus::Failed(error) => {
+                    error!(
+                        job = job.name,
+                        destination = %result.destination,
+                        archive = name,
+                        %error,
+                        "destination failed"
+                    );
+                    emit(&Event::DestinationFailed {
+                        destination: result.destination.to_string(),
+                        error: error.clone(),
+                    });
+                }
                 DeliveryStatus::Pending => {}
             }
         }
-        if failed > 0 && !staged {
-            bail!(
-                "job {:?}: {failed} destination(s) failed and no staged copy exists for retry: {}",
-                job.name,
-                describe(&results)
-            );
-        }
+        let delivered = results.len() - failed;
         let path = staging.join(name);
         let artifact = Artifact {
             name: name.to_owned(),
@@ -202,17 +226,39 @@ impl Runner {
             size: outcome.size,
             created_at,
         };
+        if failed > 0 && !staged {
+            // The copies that were delivered are recorded and the run closed
+            // before the failure is reported, so history shows them even though
+            // the scheduler will retry the slot with a fresh archive.
+            if delivered > 0 {
+                let run_id = self.state.register_run(&artifact, job, false, &results)?;
+                self.state.mark_run_complete(run_id)?;
+            }
+            bail!(
+                "job {:?}: {failed} destination(s) failed and no staged copy exists for retry: {}",
+                job.name,
+                describe(&results)
+            );
+        }
         self.state.register_run(&artifact, job, staged, &results)?;
         info!(
             job = job.name,
             archive = name,
             size = outcome.size,
-            delivered = results.len() - failed,
+            delivered,
             failed,
             staged,
             "backup finished"
         );
-        Ok(staged)
+        Ok(RunReport {
+            job: job.name.clone(),
+            archive: name.to_owned(),
+            size: artifact.size,
+            checksum: artifact.checksum,
+            delivered,
+            failed,
+            staged,
+        })
     }
 
     pub fn process_due_deliveries(&mut self) -> Result<()> {
@@ -275,6 +321,7 @@ impl Runner {
         if !directory.exists() {
             return Ok(());
         }
+        sweep_stale_partials(&directory);
         for entry in fs::read_dir(&directory)? {
             let entry = entry?;
             let path = entry.path();
@@ -334,48 +381,6 @@ impl Runner {
         }
         Ok(())
     }
-
-    pub fn print_status(&self) -> Result<()> {
-        let status = self.state.status()?;
-        if status.is_empty() {
-            println!("no pending deliveries");
-            return Ok(());
-        }
-        for line in status {
-            println!(
-                "{}  {}  {}  {} destination(s) pending",
-                line.created_at.to_rfc3339(),
-                line.job,
-                line.archive,
-                line.pending_destinations
-            );
-        }
-        Ok(())
-    }
-
-    pub fn print_history(&self, job: Option<&str>) -> Result<()> {
-        let lines: Vec<_> = self
-            .state
-            .history()?
-            .into_iter()
-            .filter(|line| job.is_none_or(|job| line.job == job))
-            .collect();
-        if lines.is_empty() {
-            println!("no completed backups in the last {HISTORY_DAYS} days");
-            return Ok(());
-        }
-        for line in lines {
-            println!(
-                "{}  {}  {:>12}  {}  finished {}",
-                line.created_at.to_rfc3339(),
-                line.job,
-                line.size,
-                line.archive,
-                line.completed_at.to_rfc3339()
-            );
-        }
-        Ok(())
-    }
 }
 
 fn needs_staging(job: &BackupJob) -> bool {
@@ -410,13 +415,16 @@ fn recovered_artifact(path: PathBuf, name: String) -> Result<Artifact> {
     };
     verify_archive(&path)?;
     let metadata = fs::metadata(&path)?;
+    let created_at = parse_archive_name(&name)
+        .context("archive name has no timestamp")?
+        .created;
     Ok(Artifact {
         name,
         path,
         checksum_path: checksum_file_path,
         checksum,
         size: metadata.len(),
-        created_at: metadata.modified()?.into(),
+        created_at,
     })
 }
 
@@ -438,11 +446,13 @@ fn remove_staged(path: &Path) -> Result<()> {
 mod tests {
     use std::fs;
     use std::path::Path;
+    use std::time::{Duration as StdDuration, SystemTime};
 
+    use chrono::Utc;
     use tempfile::tempdir;
 
     use super::Runner;
-    use crate::archive::{restore_archive, verify_archive};
+    use crate::archive::{create_local_archive, restore_archive, verify_archive};
     use crate::config::{BackupJob, Config};
     use crate::destination::list_local;
     use crate::location::Location;
@@ -555,6 +565,70 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn recovery_takes_the_archive_time_from_its_name_and_sweeps_stale_partials() {
+        let temporary = tempdir().unwrap();
+        let source = source(temporary.path());
+        let destination = temporary.path().join("destination");
+        let paths = paths(temporary.path());
+        let staging = paths.staging.join("documents");
+        let job = job(&source, vec![Location::Local(destination)]);
+
+        let artifact = create_local_archive(&job, &source, &staging).unwrap();
+        let renamed = "documents-2026-01-02T03:04:05Z-00000000-0000-0000-0000-000000000000.tar.lz4";
+        fs::rename(&artifact.path, staging.join(renamed)).unwrap();
+        fs::remove_file(&artifact.checksum_path).unwrap();
+        let stale = staging.join(".old.tar.lz4.partial");
+        fs::write(&stale, "x").unwrap();
+        fs::File::open(&stale)
+            .unwrap()
+            .set_modified(SystemTime::now() - StdDuration::from_secs(2 * 24 * 60 * 60))
+            .unwrap();
+
+        let config = Config { jobs: vec![job] };
+        let mut runner = Runner::new(config, paths).unwrap();
+        runner.recover_staging().unwrap();
+
+        assert!(!stale.exists(), "the stale partial survived recovery");
+        let due = runner.state.due_deliveries(Utc::now()).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(
+            due[0].artifact.created_at.to_rfc3339(),
+            "2026-01-02T03:04:05+00:00"
+        );
+    }
+
+    #[test]
+    fn delivered_copies_are_recorded_when_staging_and_another_destination_fail() {
+        let temporary = tempdir().unwrap();
+        let source = source(temporary.path());
+        let good = temporary.path().join("good");
+        let bad = temporary.path().join("bad");
+        fs::write(&bad, "a file where a directory is expected").unwrap();
+        let paths = paths(temporary.path());
+        fs::create_dir_all(&paths.staging).unwrap();
+        fs::write(
+            paths.staging.join("documents"),
+            "blocks the staging directory",
+        )
+        .unwrap();
+        let config = Config {
+            jobs: vec![job(
+                &source,
+                vec![Location::Local(good.clone()), Location::Local(bad)],
+            )],
+        };
+        let mut runner = Runner::new(config, paths).unwrap();
+        let job = runner.config.jobs[0].clone();
+
+        let error = runner.run_job(&job).unwrap_err();
+
+        assert!(format!("{error:#}").contains("no staged copy exists"));
+        assert_eq!(list_local(&good, "documents").unwrap().len(), 1);
+        assert!(runner.state.status().unwrap().is_empty());
+        assert_eq!(runner.state.history().unwrap().len(), 1);
     }
 
     #[test]

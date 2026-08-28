@@ -98,6 +98,11 @@ pub struct ResponseEnvelope {
 
     #[serde(default)]
     pub data: serde_json::Value,
+
+    // Zero when the remote binary predates the field, so a mismatch is
+    // reported clearly instead of failing later with a decode error.
+    #[serde(default)]
+    pub protocol: u32,
 }
 
 impl WireArtifact {

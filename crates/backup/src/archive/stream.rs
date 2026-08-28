@@ -10,8 +10,10 @@ use super::catalog::{SourceScanner, Visit, changed_paths};
 use super::format::ArchiveWriter;
 use crate::config::BackupJob;
 use crate::location::Location;
+use crate::output::{Event, emit};
 
 const CHANGED_PATHS_IN_LOG: usize = 20;
+const PROGRESS_STEP: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SinkId {
@@ -65,6 +67,7 @@ pub struct Tee {
     failed: Vec<SinkOutcome>,
     hasher: Hasher,
     size: u64,
+    reported: u64,
 }
 
 impl Tee {
@@ -74,6 +77,7 @@ impl Tee {
             failed: Vec::new(),
             hasher: Hasher::new(),
             size: 0,
+            reported: 0,
         }
     }
 
@@ -137,6 +141,10 @@ impl Write for Tee {
         self.fan_out(bytes)?;
         self.hasher.update(bytes);
         self.size += bytes.len() as u64;
+        if self.size - self.reported >= PROGRESS_STEP {
+            self.reported = self.size;
+            emit(&Event::Progress { bytes: self.size });
+        }
         Ok(bytes.len())
     }
 

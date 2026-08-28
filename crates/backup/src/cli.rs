@@ -10,6 +10,9 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub config: Option<PathBuf>,
 
+    #[arg(long, global = true)]
+    pub json: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -27,7 +30,7 @@ pub enum Command {
         follow: bool,
     },
     List {
-        job: String,
+        job: Option<String>,
     },
     Restore {
         job: String,
@@ -53,6 +56,7 @@ pub enum Command {
     History {
         job: Option<String>,
     },
+    Health,
     Install,
     Uninstall,
     #[command(hide = true)]

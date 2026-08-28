@@ -14,7 +14,7 @@ use crate::archive::{
     pump_local, restore_archive, verify_archive, verify_checksum, write_checksum,
 };
 use crate::config::BackupJob;
-use crate::destination::{apply_retention, belongs_to_job, list_local};
+use crate::destination::{apply_retention, belongs_to_job, list_local, sweep_stale_partials};
 use crate::location::Location;
 use crate::paths::AppPaths;
 use crate::protocol::{
@@ -25,6 +25,7 @@ use crate::storage::warn_if_high;
 
 pub fn run(paths: &AppPaths) -> Result<()> {
     paths.ensure()?;
+    sweep_stale_partials(&paths.staging);
     let input = stdin();
     let mut reader = BufReader::new(input.lock());
     let mut request_line = String::new();
@@ -226,6 +227,7 @@ fn receive_stream(
     fs::create_dir_all(destination)
         .with_context(|| format!("create destination {}", destination.display()))?;
     warn_if_high(destination, "destination")?;
+    sweep_stale_partials(destination);
     let partial = destination.join(format!(".{name}-{}.partial", Uuid::new_v4()));
     let received = (|| {
         let file =
@@ -289,6 +291,7 @@ fn write_success<T: Serialize>(data: &T) -> Result<()> {
         ok: true,
         error: None,
         data: to_value(data)?,
+        protocol: PROTOCOL_VERSION,
     })
 }
 
@@ -297,6 +300,7 @@ fn write_error(error: &str) -> Result<()> {
         ok: false,
         error: Some(error.to_owned()),
         data: Value::Null,
+        protocol: PROTOCOL_VERSION,
     })
 }
 

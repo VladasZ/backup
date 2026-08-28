@@ -232,6 +232,67 @@ fn cli_commands_work_while_the_daemon_runs() {
     drop(daemon);
 }
 
+fn find_state_database(root: &Path) -> PathBuf {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries {
+            let entry = entry.expect("read sandbox entry");
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if entry.file_name() == "state.redb" {
+                return path;
+            }
+        }
+    }
+    panic!("no state database under {}", root.display());
+}
+
+#[test]
+fn the_daemon_survives_a_state_database_error() {
+    let sandbox = Sandbox::new();
+    fs::write(sandbox.source().join("keep.txt"), "keep me").expect("write source file");
+    sandbox.write_config(&job_config(
+        "documents",
+        &sandbox,
+        &cron_half_a_day_ago(),
+        "",
+    ));
+
+    let mut daemon = Daemon::start(&sandbox);
+    wait_for_archives(&sandbox.destination());
+
+    let database = find_state_database(sandbox.root.path());
+    let moved = database.with_extension("redb.bak");
+    fs::rename(&database, &moved).expect("move the state database aside");
+    fs::create_dir(&database).expect("block the state database path");
+
+    // A new job forces the daemon to read the broken database, since the
+    // schedule of the already handled job is served from the in-memory cache.
+    sandbox.write_config(&format!(
+        "{}{}",
+        job_config("documents", &sandbox, &cron_half_a_day_ago(), ""),
+        job_config("extra", &sandbox, &cron_half_a_day_ago(), "")
+    ));
+    sleep(Duration::from_secs(3));
+    assert!(
+        daemon.child.try_wait().expect("check the daemon").is_none(),
+        "the daemon exited on a state database error"
+    );
+
+    fs::remove_dir(&database).expect("unblock the state database path");
+    fs::rename(&moved, &database).expect("restore the state database");
+    sleep(Duration::from_secs(2));
+    assert!(
+        daemon.child.try_wait().expect("check the daemon").is_none(),
+        "the daemon exited after the state database was restored"
+    );
+    drop(daemon);
+}
+
 #[test]
 fn retention_keeps_only_the_configured_number_of_archives() {
     let sandbox = Sandbox::new();
@@ -291,6 +352,12 @@ retention = {{ count = 1 }}
     assert!(
         !listed.contains("docs-archive-"),
         "list leaked the other job: {listed}"
+    );
+
+    let all = String::from_utf8_lossy(&sandbox.run(&["list"]).stdout).into_owned();
+    assert!(
+        all.contains("docs-2") && all.contains("docs-archive-"),
+        "list without a job missed an archive: {all}"
     );
 }
 

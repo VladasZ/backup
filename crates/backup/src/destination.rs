@@ -1,6 +1,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration as StdDuration, SystemTime};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
@@ -25,6 +26,7 @@ impl LocalSink {
         fs::create_dir_all(destination)
             .with_context(|| format!("create destination {}", destination.display()))?;
         warn_if_high(destination, "destination")?;
+        sweep_stale_partials(destination);
         let partial = destination.join(format!(".{name}.partial"));
         remove_if_present(&partial)?;
         let file =
@@ -109,6 +111,7 @@ pub fn deliver_local(artifact: &Artifact, destination: &Path, job: &BackupJob) -
     fs::create_dir_all(destination)
         .with_context(|| format!("create destination {}", destination.display()))?;
     warn_if_high(destination, "destination")?;
+    sweep_stale_partials(destination);
     let target = destination.join(&artifact.name);
     if target.exists() {
         match verify_checksum(&target, &artifact.checksum) {
@@ -309,6 +312,60 @@ pub(crate) fn belongs_to_job(name: &str, job: &str) -> bool {
     parse_archive_name(name).is_some_and(|parsed| parsed.job == job)
 }
 
+const STALE_PARTIAL_AGE: StdDuration = StdDuration::from_secs(24 * 60 * 60);
+
+// A crashed run or a killed SSH connection leaves partial files behind, and a
+// retried archive gets a new name, so nothing else ever removes them. An active
+// partial keeps a fresh modification time while bytes land, so the age guard
+// never removes a transfer that is still running.
+pub(crate) fn sweep_stale_partials(directory: &Path) {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            warn!(directory = %directory.display(), %error, "could not scan for stale partial files");
+            return;
+        }
+    };
+    let now = SystemTime::now();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                warn!(directory = %directory.display(), %error, "could not read a directory entry");
+                continue;
+            }
+        };
+        if !is_temporary_name(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
+        let path = entry.path();
+        let stale = entry
+            .metadata()
+            .and_then(|metadata| Ok((metadata.is_file(), metadata.modified()?)))
+            .map(|(is_file, modified)| {
+                is_file && now.duration_since(modified).unwrap_or_default() >= STALE_PARTIAL_AGE
+            });
+        match stale {
+            Ok(false) => {}
+            Ok(true) => match fs::remove_file(&path) {
+                Ok(()) => info!(path = %path.display(), "removed stale partial file"),
+                Err(error) => {
+                    warn!(path = %path.display(), %error, "could not remove stale partial file");
+                }
+            },
+            Err(error) => {
+                warn!(path = %path.display(), %error, "could not read the age of a partial file");
+            }
+        }
+    }
+}
+
+fn is_temporary_name(name: &str) -> bool {
+    (name.starts_with('.') && name.ends_with(".partial"))
+        || name.starts_with(".restore-")
+        || name.starts_with(".backup-write-test-")
+}
+
 fn remove_if_present(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -332,7 +389,7 @@ mod tests {
 
     use super::{
         ArchiveInfo, apply_retention, checksum_path, deliver_local, list_local, parse_archive_name,
-        retention_removals,
+        retention_removals, sweep_stale_partials,
     };
     use crate::archive::{Artifact, checksum_file, read_checksum};
     use crate::config::{BackupJob, RetentionConfig};
@@ -349,6 +406,38 @@ mod tests {
             group(12)
         );
         format!("job-2026-07-17T{hour:02}:00:00Z-{uuid}.tar.lz4")
+    }
+
+    #[test]
+    fn only_stale_temporary_files_are_swept() {
+        let temporary = tempdir().unwrap();
+        let directory = temporary.path();
+        let stale_partial = directory.join(".doc.tar.lz4.partial");
+        let stale_restore = directory.join(".restore-x-doc.tar.lz4");
+        let stale_probe = directory.join(".backup-write-test-x");
+        let fresh_partial = directory.join(".new.tar.lz4.partial");
+        let archive = directory.join(archive_name(1, 'a'));
+        for path in [
+            &stale_partial,
+            &stale_restore,
+            &stale_probe,
+            &fresh_partial,
+            &archive,
+        ] {
+            fs::write(path, "x").unwrap();
+        }
+        let old = SystemTime::now() - StdDuration::from_secs(2 * 24 * 60 * 60);
+        for path in [&stale_partial, &stale_restore, &stale_probe, &archive] {
+            fs::File::open(path).unwrap().set_modified(old).unwrap();
+        }
+
+        sweep_stale_partials(directory);
+
+        assert!(!stale_partial.exists());
+        assert!(!stale_restore.exists());
+        assert!(!stale_probe.exists());
+        assert!(fresh_partial.exists(), "a fresh partial was removed");
+        assert!(archive.exists(), "a real archive was removed");
     }
 
     #[test]
