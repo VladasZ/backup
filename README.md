@@ -134,6 +134,10 @@ exclude = [
 Unknown keys are rejected. Local and SSH paths must be absolute and cannot
 contain `..`. A destination cannot equal the source or be inside it.
 
+A configuration with no jobs is valid. The daemon starts, idles, and picks up
+jobs when they are added. This matters when another program writes the file and
+has a normal state with nothing scheduled yet.
+
 ### Compression
 
 Archives are always LZ4. There is no setting, because measurement did not

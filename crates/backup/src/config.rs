@@ -12,7 +12,7 @@ use crate::location::Location;
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    #[serde(rename = "backup")]
+    #[serde(rename = "backup", default)]
     pub jobs: Vec<BackupJob>,
 }
 
@@ -49,10 +49,10 @@ impl Config {
         Ok(config)
     }
 
+    // A configuration with no jobs is valid. A service that writes this file
+    // has a normal state where nothing is scheduled yet, and the daemon should
+    // idle and wait for a reload rather than refuse to start.
     pub fn validate(&self) -> Result<()> {
-        if self.jobs.is_empty() {
-            bail!("configuration must contain at least one [[backup]] job");
-        }
         let mut names = HashSet::new();
         for job in &self.jobs {
             job.validate()?;

@@ -453,3 +453,16 @@ fn validate_rejects_an_empty_pre_command() {
         "unexpected error: {stderr}"
     );
 }
+
+#[test]
+fn a_configuration_with_no_jobs_is_accepted() {
+    let sandbox = Sandbox::new();
+    sandbox.write_config("");
+
+    sandbox.run(&["validate"]);
+    let listed = sandbox.run(&["list"]);
+    assert_eq!(
+        String::from_utf8_lossy(&listed.stdout).trim(),
+        "no archives found"
+    );
+}
