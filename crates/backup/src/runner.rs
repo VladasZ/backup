@@ -20,9 +20,9 @@ use crate::location::Location;
 use crate::lock::AppLock;
 use crate::output::{Event, emit};
 use crate::paths::AppPaths;
+use crate::pre;
 use crate::ssh::{RemoteStream, SshSink};
 use crate::state::{DeliveryResult, DeliveryStatus, PendingDelivery, State};
-use crate::storage::warn_if_high;
 use crate::transport::deliver;
 
 pub(crate) const HISTORY_DAYS: i64 = 30;
@@ -85,10 +85,14 @@ impl Runner {
 
     fn run_job_locked(&mut self, job: &BackupJob) -> Result<RunReport> {
         info!(job = job.name, source = %job.source, "starting backup");
+        // A remote source runs its own pre command inside the agent, next to the
+        // files it touches.
+        if let (Location::Local(_), Some(command)) = (&job.source, &job.pre) {
+            pre::run(&job.name, command)?;
+        }
         let started = Utc::now();
         let (name, created_at, producer) = match &job.source {
             Location::Local(source) => {
-                warn_if_high(source, "source")?;
                 let scanner = SourceScanner::new(source, &job.exclude)?;
                 (
                     archive_name(&job.name, started),
@@ -503,6 +507,7 @@ mod tests {
             destinations,
             cron: "0 2 * * *".to_owned(),
             retention: None,
+            pre: None,
             exclude: vec!["*.tmp".to_owned()],
         }
     }

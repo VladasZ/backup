@@ -9,7 +9,7 @@ use crate::archive::Artifact;
 use crate::config::BackupJob;
 
 pub const RESPONSE_PREFIX: &str = "BACKUP/1 ";
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 const MAX_FRAME: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -26,6 +26,7 @@ pub enum AgentRequest {
         job: String,
         source: PathBuf,
         exclude: Vec<String>,
+        pre: Option<String>,
     },
     Receive {
         name: String,

@@ -1,3 +1,4 @@
+mod deploy;
 mod session;
 mod sink;
 mod stall;
@@ -70,6 +71,7 @@ impl RemoteStream {
             job: job.name.clone(),
             source: remote.path.clone(),
             exclude: job.exclude.clone(),
+            pre: job.pre.clone(),
         };
         let mut stream = SshStream::spawn(remote, &request)?;
         let header: StreamHeader = match read_response(&mut stream.reader()) {

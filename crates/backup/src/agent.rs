@@ -18,11 +18,11 @@ use crate::config::BackupJob;
 use crate::destination::{apply_retention, belongs_to_job, list_local, sweep_stale_partials};
 use crate::location::Location;
 use crate::paths::AppPaths;
+use crate::pre;
 use crate::protocol::{
     AgentRequest, PROTOCOL_VERSION, PingResponse, RESPONSE_PREFIX, ResponseEnvelope, StreamHeader,
     StreamTrailer, WireArchiveInfo, WireArtifact, copy_frames, write_end_frame, write_frame,
 };
-use crate::storage::warn_if_high;
 
 pub fn run(paths: &AppPaths) -> Result<()> {
     paths.ensure()?;
@@ -57,7 +57,6 @@ fn handle(request: AgentRequest, reader: &mut dyn BufRead, paths: &AppPaths) -> 
                     path.display()
                 );
             }
-            warn_if_high(&path, "source")?;
             write_success(&Value::Null)
         }
         AgentRequest::ValidateDestination { path } => {
@@ -68,7 +67,8 @@ fn handle(request: AgentRequest, reader: &mut dyn BufRead, paths: &AppPaths) -> 
             job,
             source,
             exclude,
-        } => create_and_stream(job, source, exclude),
+            pre,
+        } => create_and_stream(job, source, exclude, pre),
         AgentRequest::Receive {
             name,
             destination,
@@ -116,7 +116,6 @@ fn validate_destination_path(path: &Path) -> Result<()> {
     if !fs::metadata(path)?.is_dir() {
         bail!("destination {} is not a directory", path.display());
     }
-    warn_if_high(path, "destination")?;
     let probe = path.join(format!(".backup-write-test-{}", Uuid::new_v4()));
     let file = OpenOptions::new()
         .write(true)
@@ -154,8 +153,15 @@ impl Sink for FrameSink {
     }
 }
 
-fn create_and_stream(name: String, source: PathBuf, exclude: Vec<String>) -> Result<()> {
-    warn_if_high(&source, "source")?;
+fn create_and_stream(
+    name: String,
+    source: PathBuf,
+    exclude: Vec<String>,
+    pre: Option<String>,
+) -> Result<()> {
+    if let Some(command) = &pre {
+        pre::run(&name, command)?;
+    }
     let scanner = SourceScanner::new(&source, &exclude)?;
     let created_at = Utc::now();
     let archive = archive_name(&name, created_at);
@@ -165,6 +171,8 @@ fn create_and_stream(name: String, source: PathBuf, exclude: Vec<String>) -> Res
         destinations: vec![Location::Local(PathBuf::from("/"))],
         cron: "0 0 * * *".to_owned(),
         retention: None,
+        // The pre command already ran above, before the scan.
+        pre: None,
         exclude,
     };
     write_success(&StreamHeader {
@@ -227,7 +235,6 @@ fn receive_stream(
     }
     fs::create_dir_all(destination)
         .with_context(|| format!("create destination {}", destination.display()))?;
-    warn_if_high(destination, "destination")?;
     sweep_stale_partials(destination);
     let partial = destination.join(format!(".{name}-{}.partial", Uuid::new_v4()));
     let received = (|| {

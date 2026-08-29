@@ -13,7 +13,6 @@ use crate::archive::{
 use crate::config::{BackupJob, RetentionConfig};
 use crate::location::Location;
 use crate::retention::milestone_keepers;
-use crate::storage::warn_if_high;
 
 pub struct LocalSink {
     destination: PathBuf,
@@ -27,7 +26,6 @@ impl LocalSink {
     pub fn open(destination: &Path, name: &str, job: &BackupJob) -> Result<Box<dyn Sink>> {
         fs::create_dir_all(destination)
             .with_context(|| format!("create destination {}", destination.display()))?;
-        warn_if_high(destination, "destination")?;
         sweep_stale_partials(destination);
         let partial = destination.join(format!(".{name}.partial"));
         remove_if_present(&partial)?;
@@ -111,7 +109,6 @@ const TIMESTAMP_LEN: usize = 20;
 pub fn deliver_local(artifact: &Artifact, destination: &Path, job: &BackupJob) -> Result<()> {
     fs::create_dir_all(destination)
         .with_context(|| format!("create destination {}", destination.display()))?;
-    warn_if_high(destination, "destination")?;
     sweep_stale_partials(destination);
     let target = destination.join(&artifact.name);
     if target.exists() {
@@ -477,6 +474,7 @@ mod tests {
                 count: Some(5),
                 age: None,
             }),
+            pre: None,
             exclude: Vec::new(),
         };
 
@@ -545,6 +543,7 @@ mod tests {
                 count: Some(1),
                 age: None,
             }),
+            pre: None,
             exclude: Vec::new(),
         };
 
@@ -666,6 +665,7 @@ mod tests {
             destinations: vec![Location::Local(destination.clone())],
             cron: "0 0 * * *".to_owned(),
             retention: None,
+            pre: None,
             exclude: Vec::new(),
         };
 
@@ -705,6 +705,7 @@ mod tests {
             destinations: vec![Location::Local(destination.clone())],
             cron: "0 0 * * *".to_owned(),
             retention: None,
+            pre: None,
             exclude: Vec::new(),
         };
 

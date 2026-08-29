@@ -284,6 +284,7 @@ mod tests {
             destinations: vec![Location::Local(PathBuf::from("/unused"))],
             cron: "0 0 * * *".to_owned(),
             retention: None,
+            pre: None,
             exclude: Vec::new(),
         }
     }

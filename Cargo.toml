@@ -14,7 +14,6 @@ clap = { version = "4.6", features = ["derive"] }
 croner = "3.0"
 ctrlc = "3.5"
 directories = "6.0"
-fs4 = "1.1"
 humantime = "2.4"
 ignore = "0.4"
 lz4_flex = "0.14"

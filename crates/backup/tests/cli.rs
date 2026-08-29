@@ -378,3 +378,78 @@ fn validate_rejects_an_invalid_cron() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn a_pre_command_runs_before_the_archive_is_made() {
+    let sandbox = Sandbox::new();
+    fs::write(sandbox.source().join("keep.txt"), "keep me").expect("write source file");
+    let dump = sandbox.source().join("dump.sql");
+    sandbox.write_config(&job_config(
+        "documents",
+        &sandbox,
+        "0 2 * * *",
+        &format!(r#"pre = "echo dumped > {}""#, dump.display()),
+    ));
+
+    sandbox.run(&["run", "documents"]);
+
+    let restored = sandbox.path("restored");
+    sandbox.run(&[
+        "restore",
+        "documents",
+        "--to",
+        restored.to_str().expect("restore path is valid UTF-8"),
+        "--yes",
+    ]);
+
+    assert_eq!(
+        fs::read_to_string(restored.join("dump.sql")).expect("read the restored dump"),
+        "dumped\n"
+    );
+}
+
+#[test]
+fn a_failing_pre_command_fails_the_run() {
+    let sandbox = Sandbox::new();
+    fs::write(sandbox.source().join("keep.txt"), "keep me").expect("write source file");
+    sandbox.write_config(&job_config(
+        "documents",
+        &sandbox,
+        "0 2 * * *",
+        r#"pre = "echo broken >&2; exit 3""#,
+    ));
+
+    let output = sandbox
+        .command(&["run", "documents"])
+        .output()
+        .expect("run backup");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("pre command"), "unexpected error: {stderr}");
+    assert!(stderr.contains("broken"), "the error lost stderr: {stderr}");
+    assert!(archives(&sandbox.destination()).is_empty());
+}
+
+#[test]
+fn validate_rejects_an_empty_pre_command() {
+    let sandbox = Sandbox::new();
+    sandbox.write_config(&job_config(
+        "documents",
+        &sandbox,
+        "0 2 * * *",
+        r#"pre = "  ""#,
+    ));
+
+    let output = sandbox
+        .command(&["validate"])
+        .output()
+        .expect("run backup validate");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("empty pre command"),
+        "unexpected error: {stderr}"
+    );
+}

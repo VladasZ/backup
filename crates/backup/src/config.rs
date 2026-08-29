@@ -26,6 +26,7 @@ pub struct BackupJob {
     pub destinations: Vec<Location>,
     pub cron: String,
     pub retention: Option<RetentionConfig>,
+    pub pre: Option<String>,
 
     #[serde(default)]
     pub exclude: Vec<String>,
@@ -114,6 +115,11 @@ impl BackupJob {
                 bail!("job {:?} contains an empty exclusion pattern", self.name);
             }
         }
+        if let Some(pre) = &self.pre
+            && pre.trim().is_empty()
+        {
+            bail!("job {:?} has an empty pre command", self.name);
+        }
         Ok(())
     }
 
@@ -198,6 +204,6 @@ retention = { count = 3, age = "2d" }
     fn example_configuration_stays_valid() {
         let config: Config = toml::from_str(include_str!("../../../config.example.toml")).unwrap();
         config.validate().unwrap();
-        assert_eq!(config.jobs.len(), 3);
+        assert_eq!(config.jobs.len(), 4);
     }
 }

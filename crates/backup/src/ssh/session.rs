@@ -9,6 +9,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, from_str, from_value, to_writer};
 use tracing::warn;
 
+use super::deploy::agent_argv;
 use super::stall::{Stall, kill_child, wait_child};
 use crate::location::SshLocation;
 use crate::protocol::{AgentRequest, PROTOCOL_VERSION, RESPONSE_PREFIX, ResponseEnvelope};
@@ -45,7 +46,7 @@ impl Session {
     }
 
     fn start_inner(remote: &SshLocation, request: &AgentRequest, watched: bool) -> Result<Self> {
-        let mut child = ssh_command(remote)
+        let mut child = ssh_command(remote)?
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -141,7 +142,7 @@ pub struct SshStream {
 
 impl SshStream {
     pub fn spawn(remote: &SshLocation, request: &AgentRequest) -> Result<Self> {
-        let mut child = ssh_command(remote)
+        let mut child = ssh_command(remote)?
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -235,7 +236,7 @@ pub fn simple_request<T: DeserializeOwned>(
     from_value(value).context("decode agent response")
 }
 
-fn ssh_command(remote: &SshLocation) -> Command {
+pub(super) fn ssh_base(remote: &SshLocation) -> Command {
     let mut command = Command::new("ssh");
     command.args([
         "-T",
@@ -252,11 +253,14 @@ fn ssh_command(remote: &SshLocation) -> Command {
         command.arg("-p").arg(port.to_string());
     }
     // The separator keeps a hostile target string from being read as an ssh option.
+    command.arg("--").arg(remote.target());
     command
-        .arg("--")
-        .arg(remote.target())
-        .args(["backup", "agent"]);
-    command
+}
+
+fn ssh_command(remote: &SshLocation) -> Result<Command> {
+    let mut command = ssh_base(remote);
+    command.args(agent_argv(remote)?);
+    Ok(command)
 }
 
 fn write_request(writer: &mut dyn Write, request: &AgentRequest) -> Result<()> {

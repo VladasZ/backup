@@ -5,8 +5,8 @@ independent timestamped archives from local or SSH sources and delivers each
 archive to one or more local or SSH directories.
 
 The configuration is deliberately small: give each job a source, destinations,
-UTC cron schedule, optional retention rule, and optional exclusions. There is
-nothing else to choose.
+UTC cron schedule, optional retention rule, optional pre command, and optional
+exclusions. There is nothing else to choose.
 
 ## Features
 
@@ -27,6 +27,7 @@ nothing else to choose.
 - Thirty days of completed run history.
 - A health command for monitoring and a JSON mode for GUI integrations.
 - Gitignore-style exclusions configured per job.
+- An optional command run before each archive, for database dumps.
 - Automatic configuration reload.
 - Rotating log files.
 - Pure Rust. No C or C++ source is compiled into the binary.
@@ -58,6 +59,21 @@ before running `backup install`: the service definition points to the exact
 executable used for installation.
 
 Run the service as the user who owns the backups. Root is not required.
+
+### Static Linux binary
+
+On Linux, build a statically linked binary instead:
+
+```sh
+make static
+```
+
+The result is at `target/x86_64-unknown-linux-musl/release/backup`. It carries
+its own C library, so it runs on any x86_64 Linux host whatever distribution it
+uses. Prefer this build when the controller reaches other hosts over SSH. A
+normal build records the paths of the libraries it needs, and those paths may
+not exist on the host that receives the copied agent, so the copy would not
+start there.
 
 ## Quick start
 
@@ -138,6 +154,7 @@ Each `[[backup]]` record contains:
 - `destinations`: one or more local paths or SSH URIs.
 - `cron`: a five-field cron expression evaluated in UTC.
 - `retention`: optional count or age retention.
+- `pre`: optional shell command run before the archive.
 - `exclude`: optional gitignore-style patterns.
 
 A source may be one regular file or a directory. The source path itself must not
@@ -165,10 +182,23 @@ The service invokes the system `ssh` command with batch mode enabled. It uses
 normal SSH configuration, aliases, agents, keys, users, ports, and
 `IdentityFile` entries. Password prompts are not supported.
 
-The same `backup` binary must be installed on every remote host and available
-as `backup` in its non-interactive SSH `PATH`. The controller invokes the
-hidden `backup agent` command. A remote host does not need a configuration just
-to act as an agent.
+The controller runs the hidden `backup agent` command on the remote host. It
+does not need one installed there. On first contact it copies its own binary to
+`~/.cache/backup/agent-<hash>` on the remote and runs that, so both ends always
+run the same build and the protocol versions cannot drift. The name carries a
+hash of the binary, so a new build lands next to the old one instead of
+replacing a copy that a running session is using. A remote host does not need a
+configuration just to act as an agent.
+
+The copied binary is proved by running it, not by comparing platforms, because a
+remote can report the same kernel and machine and still not run the binary. When
+the copy does not run there, for example a macOS controller and a Linux remote,
+the controller falls back to a `backup` binary installed on the remote and
+available in its non-interactive SSH `PATH`.
+
+Use the static Linux build for a controller that reaches other Linux hosts, so
+the copy always runs and the fallback is never needed. See
+[Static Linux binary](#static-linux-binary).
 
 Every agent response carries the protocol version, so a remote running an
 incompatible backup binary fails any command with a clear error, not only
@@ -177,7 +207,7 @@ incompatible backup binary fails any command with a clear error, not only
 Test the remote setup before installing the service:
 
 ```sh
-ssh -T -o BatchMode=yes backup-box backup --version
+ssh -T -o BatchMode=yes backup-box true
 backup validate
 ```
 
@@ -236,6 +266,35 @@ counts only the remaining archives. There is no setting for this. A month is
 30 days and a year is 365 days, measured from the timestamp in the archive
 name. Jobs without a retention rule are unaffected, since they never delete
 anything.
+
+### Pre command
+
+A job may run one shell command before its archive is made:
+
+```toml
+pre = "pg_dump -U app app > /srv/app/dumps/app.sql"
+```
+
+The command runs where the source is. A local source runs it on this machine, an
+SSH source runs it on the remote host through the agent. It runs with `sh -c`,
+before the source is scanned, so anything it writes into the source is part of
+the archive.
+
+The command must succeed. A non-zero exit fails the whole run, the error carries
+its standard error, and nothing is delivered. A scheduled run that fails this way
+is retried like any other failed slot.
+
+The main use is a database. A live database folder cannot be archived file by
+file and be trusted to start again, so exclude the folder and archive a dump
+instead:
+
+```toml
+pre = "pg_dump -U app app > /srv/app/dumps/app.sql"
+exclude = ["postgres/"]
+```
+
+Output is captured and not shown, so redirect anything you want to keep into a
+file inside the source.
 
 ### Exclusions
 
@@ -588,12 +647,8 @@ its own ownership and does not fail on that.
 
 ## Disk space
 
-Sources, staging, and destinations log a warning at 80 percent use. Use is
-measured as space not available to the service, so space a filesystem reserves
-for root counts as used, and the warning can appear a little earlier than a
-plain disk tool would show.
-
-There is no free space check before a run. A destination or staging disk that
+There is no free space check before a run, and no warning about a filesystem
+filling up. A destination or staging disk that
 fills up fails only that copy, its partial file is removed, and the other
 copies continue.
 
@@ -638,6 +693,7 @@ path is not configurable.
 make ci     # typos, fmt, clippy with -D warnings, unused dependency check
 make test   # unit and integration tests, debug and release
 make build  # release binary
+make static # statically linked Linux release binary
 ```
 
 `make ci` needs `typos-cli` and `cargo-machete`. GitHub Actions runs both

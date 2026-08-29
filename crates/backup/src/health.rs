@@ -121,6 +121,7 @@ mod tests {
                 destinations: vec![Location::Local(PathBuf::from("/destination"))],
                 cron: "0 2 * * *".to_owned(),
                 retention: None,
+                pre: None,
                 exclude: Vec::new(),
             }],
         }

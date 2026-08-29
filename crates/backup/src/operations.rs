@@ -22,7 +22,6 @@ use crate::ssh::{
     fetch_remote, list_remote, prune_remote, restore_remote, validate_agent, validate_destination,
     validate_source, verify_remote,
 };
-use crate::storage::warn_if_high;
 
 #[derive(Clone, Debug)]
 struct LocatedArchive {
@@ -291,7 +290,6 @@ fn validate_local_source(source: &Path) -> Result<()> {
             source.display()
         );
     }
-    warn_if_high(source, "source")?;
     Ok(())
 }
 
@@ -301,7 +299,6 @@ fn validate_local_destination(destination: &Path) -> Result<()> {
     if !fs::metadata(destination)?.is_dir() {
         bail!("destination {} is not a directory", destination.display());
     }
-    warn_if_high(destination, "destination")?;
     let probe = destination.join(format!(".backup-write-test-{}", Uuid::new_v4()));
     let file = OpenOptions::new()
         .write(true)
@@ -504,6 +501,7 @@ mod tests {
             destinations: vec![Location::Local(destination.clone())],
             cron: "0 2 * * *".to_owned(),
             retention: None,
+            pre: None,
             exclude: Vec::new(),
         };
 
@@ -544,6 +542,7 @@ mod tests {
             ],
             cron: "0 2 * * *".to_owned(),
             retention: None,
+            pre: None,
             exclude: Vec::new(),
         };
         let artifact = create_local_archive(&job, &source, &staging).unwrap();

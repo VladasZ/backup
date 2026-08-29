@@ -13,13 +13,13 @@ pub mod logs;
 pub mod operations;
 pub mod output;
 pub mod paths;
+pub mod pre;
 pub mod protocol;
 pub mod retention;
 pub mod runner;
 pub mod service;
 pub mod ssh;
 pub mod state;
-pub mod storage;
 pub mod transport;
 
 use std::process::ExitCode;

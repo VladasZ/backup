@@ -20,6 +20,7 @@ fn tracks_each_destination_and_completes_only_after_all_deliveries() {
         destinations: vec![first.clone(), second.clone()],
         cron: "0 2 * * *".to_owned(),
         retention: None,
+        pre: None,
         exclude: Vec::new(),
     };
     let artifact = Artifact {
@@ -72,6 +73,7 @@ fn registered_results_skip_delivered_destinations_and_retry_failed_ones() {
         destinations: vec![first.clone(), second.clone()],
         cron: "0 2 * * *".to_owned(),
         retention: None,
+        pre: None,
         exclude: Vec::new(),
     };
     let artifact = Artifact {
@@ -115,6 +117,7 @@ fn completed_runs_show_in_history_until_purged() {
         destinations: vec![destination.clone()],
         cron: "0 2 * * *".to_owned(),
         retention: None,
+        pre: None,
         exclude: Vec::new(),
     };
     let artifact = Artifact {

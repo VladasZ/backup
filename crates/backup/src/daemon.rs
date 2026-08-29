@@ -277,6 +277,7 @@ mod tests {
             destinations: vec![Location::Local(PathBuf::from("/destination"))],
             cron: "0 2 * * *".to_owned(),
             retention: None,
+            pre: None,
             exclude: Vec::new(),
         };
         let now = Utc
@@ -301,6 +302,7 @@ mod tests {
             destinations: vec![Location::Local(PathBuf::from("/destination"))],
             cron: "0 * * * *".to_owned(),
             retention: None,
+            pre: None,
             exclude: Vec::new(),
         };
         let now = Utc.with_ymd_and_hms(2026, 7, 17, 12, 45, 0).unwrap();

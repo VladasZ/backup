@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 const BINARY: &str = env!("CARGO_BIN_EXE_backup");
 const IMAGE: &str = "backup-test-sshd:1";
 const CONTAINER: &str = "backup-test-sshd";
+const COPY_CONTAINER: &str = "backup-test-sshd-copy";
 const READY_WAIT: Duration = Duration::from_secs(60);
 
 fn workspace_root() -> PathBuf {
@@ -71,9 +72,31 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
     );
 }
 
+// A Linux host binary is not automatically usable inside the image. A NixOS
+// build hardcodes a loader path under /nix/store that debian does not have, so
+// the copy has to be proved by running it.
+fn runs_in_image(binary: &Path) -> bool {
+    Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "-v",
+            &format!("{}:/probe:ro", binary.display()),
+            IMAGE,
+            "/probe",
+            "--version",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 fn agent_binary() -> PathBuf {
-    if cfg!(target_os = "linux") {
-        return PathBuf::from(BINARY);
+    let host = PathBuf::from(BINARY);
+    if cfg!(target_os = "linux") && runs_in_image(&host) {
+        return host;
     }
     let root = workspace_root();
     let target = root.join("target/linux-agent");
@@ -127,12 +150,13 @@ fn sources_newer_than(sources: &Path, binary: &Path) -> bool {
 }
 
 struct RemoteHost {
+    name: &'static str,
     port: u16,
     key: PathBuf,
 }
 
 impl RemoteHost {
-    fn start(sandbox: &Path) -> Self {
+    fn start(sandbox: &Path, name: &'static str) -> Self {
         build_image();
         let key = sandbox.join("id_ed25519");
         require(
@@ -148,20 +172,12 @@ impl RemoteHost {
             ],
         );
 
-        run("docker", &["rm", "-f", CONTAINER]);
+        run("docker", &["rm", "-f", name]);
         require(
             "docker",
-            &[
-                "run",
-                "-d",
-                "--name",
-                CONTAINER,
-                "-p",
-                "127.0.0.1::22",
-                IMAGE,
-            ],
+            &["run", "-d", "--name", name, "-p", "127.0.0.1::22", IMAGE],
         );
-        let published = require("docker", &["port", CONTAINER, "22"]);
+        let published = require("docker", &["port", name, "22"]);
         let port = published
             .lines()
             .next()
@@ -172,17 +188,13 @@ impl RemoteHost {
         let public = format!("{}.pub", key.display());
         require(
             "docker",
-            &[
-                "cp",
-                &public,
-                &format!("{CONTAINER}:/root/.ssh/authorized_keys"),
-            ],
+            &["cp", &public, &format!("{name}:/root/.ssh/authorized_keys")],
         );
         require(
             "docker",
             &[
                 "exec",
-                CONTAINER,
+                name,
                 "sh",
                 "-c",
                 "chown root:root /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys",
@@ -194,11 +206,11 @@ impl RemoteHost {
             &[
                 "cp",
                 agent.to_str().expect("agent path"),
-                &format!("{CONTAINER}:/usr/local/bin/backup"),
+                &format!("{name}:/usr/local/bin/backup"),
             ],
         );
 
-        let host = Self { port, key };
+        let host = Self { name, port, key };
         host.write_ssh_config(sandbox);
         host.wait_until_ready(sandbox);
         host
@@ -271,13 +283,13 @@ impl RemoteHost {
     }
 
     fn exec(&self, script: &str) -> String {
-        require("docker", &["exec", CONTAINER, "sh", "-c", script])
+        require("docker", &["exec", self.name, "sh", "-c", script])
     }
 }
 
 impl Drop for RemoteHost {
     fn drop(&mut self) {
-        let output = run("docker", &["rm", "-f", CONTAINER]);
+        let output = run("docker", &["rm", "-f", self.name]);
         if !output.status.success() {
             eprintln!(
                 "could not remove the test container: {}",
@@ -367,7 +379,7 @@ fn every_combination_of_local_and_ssh_endpoints_round_trips() {
     }
     fs::write(root.join("source/hello.txt"), "local content").expect("write local source");
 
-    let remote = RemoteHost::start(&root);
+    let remote = RemoteHost::start(&root, CONTAINER);
     remote.exec("mkdir -p /srv/source && printf 'remote content' > /srv/source/hello.txt");
 
     let local_source = root.join("source").display().to_string();
@@ -478,5 +490,48 @@ fn every_combination_of_local_and_ssh_endpoints_round_trips() {
     assert!(
         status.contains("1 destination(s) pending"),
         "the failed remote delivery was not kept for retry:\n{status}"
+    );
+}
+
+#[test]
+fn a_copied_agent_works_without_one_installed() {
+    if !docker_available() {
+        eprintln!("skipping: docker is not available");
+        return;
+    }
+    build_image();
+    if !runs_in_image(Path::new(BINARY)) {
+        eprintln!("skipping: this build does not run inside the test image");
+        return;
+    }
+
+    let sandbox = tempfile::tempdir().expect("create sandbox");
+    let root = sandbox.path().to_path_buf();
+    for directory in ["home", "state", "source"] {
+        fs::create_dir_all(root.join(directory)).expect("create sandbox directory");
+    }
+    fs::write(root.join("source/hello.txt"), "local content").expect("write local source");
+
+    let remote = RemoteHost::start(&root, COPY_CONTAINER);
+    remote.exec("rm -f /usr/local/bin/backup");
+
+    let case = Case {
+        name: "copied-agent",
+        source: root.join("source").display().to_string(),
+        destination: remote.uri("/srv/copied"),
+    };
+    write_config(&root, &case);
+    backup_ok(&root, &["validate"]);
+    backup_ok(&root, &["run", case.name]);
+
+    let delivered = remote.exec("ls /srv/copied");
+    assert!(
+        delivered.contains(".tar.lz4"),
+        "no archive reached the remote:\n{delivered}"
+    );
+    let cached = remote.exec("ls $HOME/.cache/backup");
+    assert!(
+        cached.contains("agent-"),
+        "the agent was not copied to the remote:\n{cached}"
     );
 }

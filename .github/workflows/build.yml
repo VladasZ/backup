@@ -40,6 +40,20 @@ jobs:
       - name: Run tests
         run: make test
 
+  static:
+    name: Static Linux Binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build
+        run: make static
+
+      - name: Check the binary is static and runs
+        run: |
+          file target/x86_64-unknown-linux-musl/release/backup | grep -q "statically linked"
+          ./target/x86_64-unknown-linux-musl/release/backup --version
+
   install:
     name: Install Service
     runs-on: ubuntu-latest

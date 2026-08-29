@@ -99,6 +99,7 @@ mod tests {
             destinations: vec![Location::Local(PathBuf::from("/unused"))],
             cron: "0 0 * * *".to_owned(),
             retention: None,
+            pre: None,
             exclude: Vec::new(),
         }
     }
@@ -191,6 +192,7 @@ mod tests {
                 count: Some(2),
                 age: None,
             }),
+            pre: None,
             exclude: Vec::new(),
         };
 
