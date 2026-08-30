@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Timelike, Utc};
-use notify::{Event, RecursiveMode, Result as NotifyResult, Watcher, recommended_watcher};
+use notify::{
+    Event, EventKind, RecursiveMode, Result as NotifyResult, Watcher, recommended_watcher,
+};
 use tracing::{error, info, warn};
 
 use crate::config::{BackupJob, Config};
@@ -206,8 +208,14 @@ pub(crate) fn unhandled_slot(
     Ok((!last.is_some_and(|last| last >= latest)).then_some(latest))
 }
 
+// Reading a file emits access events on the watched directory, and a reload
+// itself reads the configuration. Reacting to those would reload forever.
 fn affects_config(event: &Event, config: &Path) -> bool {
-    event.paths.is_empty() || event.paths.iter().any(|path| path == config)
+    let changes = matches!(
+        event.kind,
+        EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_) | EventKind::Any
+    );
+    changes && (event.paths.is_empty() || event.paths.iter().any(|path| path == config))
 }
 
 fn event_requires_reload(event: NotifyResult<Event>, config: &Path) -> bool {
@@ -236,11 +244,25 @@ mod tests {
     use std::path::PathBuf;
 
     use chrono::{DateTime, Duration, TimeZone, Timelike, Utc};
+    use notify::event::{AccessKind, AccessMode, ModifyKind};
+    use notify::{Event, EventKind};
 
-    use super::{due_backup, unhandled_slot};
+    use super::{affects_config, due_backup, unhandled_slot};
     use crate::config::BackupJob;
     use crate::location::Location;
     use crate::state::BackupRetry;
+
+    // The daemon once reloaded on the access events of its own config reads
+    // and spun at full CPU forever. This pins that only changes count.
+    #[test]
+    fn reading_the_configuration_does_not_trigger_a_reload() {
+        let config = PathBuf::from("/config/config.toml");
+        let read = Event::new(EventKind::Access(AccessKind::Close(AccessMode::Read)))
+            .add_path(config.clone());
+        assert!(!affects_config(&read, &config));
+        let write = Event::new(EventKind::Modify(ModifyKind::Any)).add_path(config.clone());
+        assert!(affects_config(&write, &config));
+    }
 
     #[test]
     fn scheduled_backup_backs_off_then_retries() {
