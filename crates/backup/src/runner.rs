@@ -605,7 +605,7 @@ mod tests {
         let job = job(&source, vec![Location::Local(destination)]);
 
         let artifact = create_local_archive(&job, &source, &staging).unwrap();
-        let renamed = "documents-2026-01-02T03:04:05Z-00000000-0000-0000-0000-000000000000.tar.lz4";
+        let renamed = "documents-20260102T030405Z-00000000-0000-0000-0000-000000000000.tar.lz4";
         fs::rename(&artifact.path, staging.join(renamed)).unwrap();
         fs::remove_file(&artifact.checksum_path).unwrap();
         let stale = staging.join(".old.tar.lz4.partial");

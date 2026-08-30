@@ -421,7 +421,7 @@ Restore an exact archive:
 
 ```sh
 backup restore documents \
-  documents-2026-07-17T02:00:00Z-01234567-89ab-cdef-0123-456789abcdef.tar.lz4 \
+  documents-20260717T020000Z-01234567-89ab-cdef-0123-456789abcdef.tar.lz4 \
   --to /srv/documents
 ```
 
@@ -566,14 +566,17 @@ the whole slot.
 Names use this form:
 
 ```text
-<job>-<UTC RFC3339 timestamp>-<UUID>.<archive extension>
+<job>-<compact UTC timestamp>-<UUID>.<archive extension>
 ```
 
 For example:
 
 ```text
-documents-2026-07-17T02:00:00Z-01234567-89ab-cdef-0123-456789abcdef.tar.lz4
+documents-20260717T020000Z-01234567-89ab-cdef-0123-456789abcdef.tar.lz4
 ```
+
+The timestamp has no colons on purpose. Colons are illegal in SMB names, so
+an archive named with RFC3339 shows up mangled over a samba share.
 
 Every archive has a neighboring `.blake3` checksum file. Archives and
 checksum files are written under partial names, synced, verified, and atomically

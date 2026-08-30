@@ -10,7 +10,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Utc};
 
 use crate::config::ARCHIVE_EXTENSION;
 
@@ -45,8 +45,10 @@ pub fn create_private(path: &Path) -> Result<File> {
         .with_context(|| format!("create {}", path.display()))
 }
 
+// Colons are illegal in SMB names, so an RFC3339 timestamp makes samba serve
+// the file under a mangled 8.3 name. The compact form has no colons.
 pub fn archive_name(job: &str, created_at: DateTime<Utc>) -> String {
-    let timestamp = created_at.to_rfc3339_opts(SecondsFormat::Secs, true);
+    let timestamp = created_at.format("%Y%m%dT%H%M%SZ");
     format!(
         "{job}-{timestamp}-{}.{ARCHIVE_EXTENSION}",
         uuid::Uuid::new_v4()

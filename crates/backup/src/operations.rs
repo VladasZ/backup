@@ -506,7 +506,7 @@ mod tests {
         };
 
         let mut old = create_local_archive(&job, &source, &staging).unwrap();
-        let old_name = "docs-2026-01-01T00:00:00Z-00000000-0000-0000-0000-000000000000.tar.lz4";
+        let old_name = "docs-20260101T000000Z-00000000-0000-0000-0000-000000000000.tar.lz4";
         let old_path = staging.join(old_name);
         fs::rename(&old.path, &old_path).unwrap();
         old.name = old_name.to_owned();

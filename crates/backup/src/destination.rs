@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration as StdDuration, SystemTime};
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use tracing::{info, warn};
 
 use crate::archive::{
@@ -101,10 +101,11 @@ pub struct ArchiveInfo {
 
 const ARCHIVE_SUFFIX: &str = ".tar.lz4";
 
-// Archive names are "<job>-<RFC3339 seconds>-<uuid>.tar.lz4". Both trailing parts have a fixed
-// width, so the job name is whatever is left after removing them, even when it contains a dash.
+// Archive names are "<job>-<compact UTC seconds>-<uuid>.tar.lz4". Both trailing parts have a
+// fixed width, so the job name is whatever is left after removing them, even when it contains a
+// dash.
 const UUID_LEN: usize = 36;
-const TIMESTAMP_LEN: usize = 20;
+const TIMESTAMP_LEN: usize = 16;
 
 pub fn deliver_local(artifact: &Artifact, destination: &Path, job: &BackupJob) -> Result<()> {
     fs::create_dir_all(destination)
@@ -220,10 +221,11 @@ pub(crate) fn parse_archive_name(name: &str) -> Option<ParsedArchive<'_>> {
     let rest = name.strip_suffix(ARCHIVE_SUFFIX)?;
     let rest = rest.get(..rest.len().checked_sub(UUID_LEN + 1)?)?;
     let split = rest.len().checked_sub(TIMESTAMP_LEN + 1)?;
-    let (job, stamp) = rest.split_at(split);
-    let created = DateTime::parse_from_rfc3339(stamp.strip_prefix('-')?)
+    let job = rest.get(..split)?;
+    let stamp = rest.get(split..)?.strip_prefix('-')?;
+    let created = NaiveDateTime::parse_from_str(stamp, "%Y%m%dT%H%M%SZ")
         .ok()?
-        .with_timezone(&Utc);
+        .and_utc();
     Some(ParsedArchive { job, created })
 }
 
@@ -407,7 +409,7 @@ mod tests {
             group(4),
             group(12)
         );
-        format!("job-2026-07-17T{hour:02}:00:00Z-{uuid}.tar.lz4")
+        format!("job-20260717T{hour:02}0000Z-{uuid}.tar.lz4")
     }
 
     #[test]
@@ -529,9 +531,8 @@ mod tests {
     fn retention_leaves_a_job_whose_name_starts_with_this_one_alone() {
         let temporary = tempdir().unwrap();
         let shared = temporary.path();
-        let mine = "docs-2026-07-17T01:00:00Z-00000000-0000-0000-0000-000000000000.tar.lz4";
-        let theirs =
-            "docs-archive-2026-07-17T02:00:00Z-11111111-1111-1111-1111-111111111111.tar.lz4";
+        let mine = "docs-20260717T010000Z-00000000-0000-0000-0000-000000000000.tar.lz4";
+        let theirs = "docs-archive-20260717T020000Z-11111111-1111-1111-1111-111111111111.tar.lz4";
         fs::write(shared.join(mine), "mine").unwrap();
         fs::write(shared.join(theirs), "theirs").unwrap();
         let job = BackupJob {
@@ -556,7 +557,7 @@ mod tests {
 
     #[test]
     fn a_job_name_containing_dashes_still_parses() {
-        let name = "my-nice-job-2026-07-17T02:00:00Z-11111111-1111-1111-1111-111111111111.tar.lz4";
+        let name = "my-nice-job-20260717T020000Z-11111111-1111-1111-1111-111111111111.tar.lz4";
         let parsed = parse_archive_name(name).unwrap();
         assert_eq!(parsed.job, "my-nice-job");
         assert_eq!(parsed.created.to_rfc3339(), "2026-07-17T02:00:00+00:00");
