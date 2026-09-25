@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::slice::from_ref;
 use std::time::{Duration, SystemTime};
 
 use chrono::{Duration as ChronoDuration, Utc};
@@ -12,7 +13,7 @@ use super::Store;
 use super::check::{check_store, finish_repair, put_repaired};
 use super::digest::Digest;
 use super::gc::{apply_retention, collect_garbage};
-use super::import::{import_legacy, legacy_names};
+use super::import::{import_group, legacy_names};
 use super::index::{INDEX, pack_files};
 use super::recipe::Recipe;
 use crate::archive::{ChunkEvent, SourceScanner, archive_name, produce, restore_stream};
@@ -324,11 +325,16 @@ fn a_run_that_dies_before_its_recipe_publishes_nothing() {
 
 fn legacy_archive(root: &Path, source: &Path, job: &str, corrupt: bool) -> String {
     let name = archive_name(job, Utc::now() - ChronoDuration::days(3));
+    write_legacy(root, source, &name, corrupt);
+    name
+}
+
+fn write_legacy(root: &Path, source: &Path, name: &str, corrupt: bool) {
     let mut tar = tar::Builder::new(FrameEncoder::new(Vec::new()));
     tar.append_dir_all(".", source).unwrap();
     let bytes = tar.into_inner().unwrap().finish().unwrap();
     fs::create_dir_all(root).unwrap();
-    fs::write(root.join(&name), &bytes).unwrap();
+    fs::write(root.join(name), &bytes).unwrap();
     let checksum = if corrupt {
         "0".repeat(64)
     } else {
@@ -336,7 +342,6 @@ fn legacy_archive(root: &Path, source: &Path, job: &str, corrupt: bool) -> Strin
     };
     let mut file = File::create(root.join(format!("{name}.blake3"))).unwrap();
     writeln!(file, "{checksum}  {name}").unwrap();
-    name
 }
 
 #[test]
@@ -347,7 +352,8 @@ fn an_old_archive_is_imported_and_then_deleted() {
     let name = legacy_archive(&root, &source, "docs", false);
     assert_eq!(legacy_names(&root).unwrap(), vec![name.clone()]);
 
-    let (mut store, report) = import_legacy(Store::open(&root).unwrap(), &name).unwrap();
+    let report = import_group(from_ref(&root), &name).unwrap();
+    let mut store = Store::open(&root).unwrap();
 
     assert_eq!(report.name, name);
     assert!(!root.join(&name).exists(), "the original was kept");
@@ -369,7 +375,7 @@ fn an_old_archive_that_fails_its_checksum_is_kept() {
     let root = temporary.path().join("dest");
     let name = legacy_archive(&root, &source, "docs", true);
 
-    let result = import_legacy(Store::open(&root).unwrap(), &name);
+    let result = import_group(from_ref(&root), &name);
 
     assert!(result.is_err());
     assert!(
@@ -406,4 +412,31 @@ fn cleanup_frees_duplicate_packs_from_two_writers_and_keeps_every_chunk() {
     let target = temporary.path().join("restored");
     restore(&mut store, &recipe, &target);
     assert_eq!(fs::read(target.join("a.bin")).unwrap(), data);
+}
+
+#[test]
+fn one_read_imports_an_archive_into_every_folder_that_holds_it() {
+    let temporary = tempdir().unwrap();
+    let data = noise(3 * 1024 * 1024, 13);
+    let source = source_with(temporary.path(), &[("a.bin", data.clone())]);
+    let first = temporary.path().join("first");
+    let second = temporary.path().join("second");
+    let name = legacy_archive(&first, &source, "docs", true);
+    write_legacy(&second, &source, &name, false);
+
+    // The first copy fails its checksum, so the second one is read.
+    import_group(&[first.clone(), second.clone()], &name).unwrap();
+
+    for root in [&first, &second] {
+        assert!(
+            !root.join(&name).exists(),
+            "an original was kept in {}",
+            root.display()
+        );
+        let mut store = Store::open(root).unwrap();
+        let recipe = store.read_recipe(&name).unwrap();
+        let target = root.join("restored");
+        restore(&mut store, &recipe, &target);
+        assert_eq!(fs::read(target.join("a.bin")).unwrap(), data);
+    }
 }

@@ -663,10 +663,11 @@ shared destination cannot read backup contents.
 
 Older versions stored each backup as one `.tar.lz4` file with a `.blake3` file
 next to it. The daemon imports these on its own, one at a time, oldest first,
-between scheduled backups. Each import reads the file once, checks it against
-its `.blake3`, and stores its chunks. The original is deleted only after the
-stream rebuilt from the store matches it byte for byte and reads as a valid
-TAR. A failed import keeps the original, shows in `backup health`, and is tried
+between scheduled backups. The same archive in several local destinations is
+read only once, from the first copy that matches its `.blake3`, and its chunks
+go to every one of those stores. Each store is then checked on its own, and a
+destination's original is deleted only after the stream rebuilt from that store
+matches the archive byte for byte and reads as a valid TAR. A failed import keeps the original, shows in `backup health`, and is tried
 again after a day.
 
 ## Consistency and filesystem behavior

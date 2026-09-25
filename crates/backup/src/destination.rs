@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 use std::io::Read;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::archive::verify_stream;
 use crate::config::BackupJob;
@@ -13,7 +13,7 @@ use crate::ssh::{self, RemoteSource, SshRepair};
 use crate::store::check::{StoreCheck, check_store, finish_repair, put_repaired};
 use crate::store::digest::Digest;
 use crate::store::gc::apply_retention;
-use crate::store::import::{ImportReport, import_legacy, legacy_names};
+use crate::store::import::{ImportReport, import_group, legacy_names};
 use crate::store::recipe::{Recipe, RecipeInfo};
 use crate::store::{Store, StoreWriter};
 use crate::stream::{ChunkSource, RecipeStream, SourceRef};
@@ -133,9 +133,25 @@ pub fn legacy(destination: &Location) -> Result<Vec<String>> {
     }
 }
 
-pub fn import(destination: &Location, name: &str) -> Result<ImportReport> {
-    match destination {
-        Location::Local(path) => import_legacy(Store::open(path)?, name).map(|(_, report)| report),
-        Location::Ssh(remote) => ssh::import(remote, name),
+/// Imports one old archive into every destination that holds it. The local
+/// ones share a single read of the archive. A remote one imports its own copy
+/// inside its agent.
+pub fn import(destinations: &[Location], name: &str) -> Result<ImportReport> {
+    let local: Vec<_> = destinations
+        .iter()
+        .filter_map(|destination| match destination {
+            Location::Local(path) => Some(path.clone()),
+            Location::Ssh(_) => None,
+        })
+        .collect();
+    let mut report = None;
+    if !local.is_empty() {
+        report = Some(import_group(&local, name)?);
     }
+    for destination in destinations {
+        if let Location::Ssh(remote) = destination {
+            report = Some(ssh::import(remote, name)?);
+        }
+    }
+    report.context("no destination to import into")
 }

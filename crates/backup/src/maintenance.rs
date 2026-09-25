@@ -3,12 +3,13 @@
 //! at a time. Each step is short enough that a backup coming due waits at
 //! most for one of them.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use tracing::{error, info, warn};
 
+use crate::archive::parse_archive_name;
 use crate::destination;
 use crate::location::Location;
 use crate::lock::AppLock;
@@ -21,27 +22,31 @@ const IMPORT_RESCAN_MINUTES: i64 = 60;
 // passing as a remote that was offline.
 const IMPORT_RETRY_HOURS: i64 = 24;
 
+// The daemon is the only writer of verify times, so they are cached and idle
+// ticks never open the state database.
 #[derive(Default)]
 pub struct Maintenance {
-    imports: VecDeque<(Location, String)>,
+    imports: VecDeque<(Vec<Location>, String)>,
     next_scan: Option<DateTime<Utc>>,
+    verified: HashMap<Location, DateTime<Utc>>,
 }
 
 impl Maintenance {
     /// Runs at most one verify or one import. Returns whether it did work.
     pub fn step(&mut self, runner: &mut Runner, now: DateTime<Utc>) -> Result<bool> {
-        if let Some((destination, peers)) = due_verification(runner, now)? {
+        if let Some((destination, peers)) = self.due_verification(runner, now)? {
             verify(runner, &destination, &peers, now)?;
+            self.verified.insert(destination, now);
             return Ok(true);
         }
         if self.imports.is_empty() && self.next_scan.is_none_or(|next| now >= next) {
             self.scan(runner, now)?;
             self.next_scan = Some(now + Duration::minutes(IMPORT_RESCAN_MINUTES));
         }
-        let Some((destination, name)) = self.imports.pop_front() else {
+        let Some((destinations, name)) = self.imports.pop_front() else {
             return Ok(false);
         };
-        import(runner, &destination, &name)?;
+        import(runner, &destinations, &name)?;
         Ok(true)
     }
 
@@ -53,12 +58,19 @@ impl Maintenance {
             .filter(|failure| now - failure.at < Duration::hours(IMPORT_RETRY_HOURS))
             .map(|failure| (failure.destination, failure.archive))
             .collect();
+        // The same archive usually sits in several destinations. They are
+        // grouped by name so it is read once and written to all of them.
+        let mut groups: Vec<(Vec<Location>, String)> = Vec::new();
         for (destination, _) in destinations_with_peers(&runner.config) {
             match destination::legacy(&destination) {
                 Ok(names) => {
                     for name in names {
-                        if !failed.contains(&(destination.to_string(), name.clone())) {
-                            self.imports.push_back((destination.clone(), name));
+                        if failed.contains(&(destination.to_string(), name.clone())) {
+                            continue;
+                        }
+                        match groups.iter_mut().find(|(_, known)| *known == name) {
+                            Some((locations, _)) => locations.push(destination.clone()),
+                            None => groups.push((vec![destination.clone()], name)),
                         }
                     }
                 }
@@ -67,6 +79,8 @@ impl Maintenance {
                 }
             }
         }
+        groups.sort_by_key(|(_, name)| created(name));
+        self.imports.extend(groups);
         if !self.imports.is_empty() {
             info!(
                 archives = self.imports.len(),
@@ -77,22 +91,35 @@ impl Maintenance {
     }
 }
 
-// A destination seen for the first time starts its clock now, so it is
-// verified a week later rather than at once.
-fn due_verification(
-    runner: &Runner,
-    now: DateTime<Utc>,
-) -> Result<Option<(Location, Vec<Location>)>> {
-    for (destination, peers) in destinations_with_peers(&runner.config) {
-        match runner.state.last_verified(&destination)? {
-            None => runner.state.set_last_verified(&destination, now)?,
-            Some(last) if now - last >= Duration::days(VERIFY_EVERY_DAYS) => {
+impl Maintenance {
+    // A destination seen for the first time starts its clock now, so it is
+    // verified a week later rather than at once.
+    fn due_verification(
+        &mut self,
+        runner: &Runner,
+        now: DateTime<Utc>,
+    ) -> Result<Option<(Location, Vec<Location>)>> {
+        for (destination, peers) in destinations_with_peers(&runner.config) {
+            let last = match self.verified.get(&destination) {
+                Some(last) => *last,
+                None => {
+                    let last = match runner.state.last_verified(&destination)? {
+                        Some(last) => last,
+                        None => {
+                            runner.state.set_last_verified(&destination, now)?;
+                            now
+                        }
+                    };
+                    self.verified.insert(destination.clone(), last);
+                    last
+                }
+            };
+            if now - last >= Duration::days(VERIFY_EVERY_DAYS) {
                 return Ok(Some((destination, peers)));
             }
-            Some(_) => {}
         }
+        Ok(None)
     }
-    Ok(None)
 }
 
 fn verify(
@@ -132,22 +159,35 @@ fn verify(
     Ok(())
 }
 
-fn import(runner: &mut Runner, destination: &Location, name: &str) -> Result<()> {
+fn import(runner: &mut Runner, destinations: &[Location], name: &str) -> Result<()> {
     let operation_lock = AppLock::exclusive(&runner.paths.operation_lock)?;
-    let imported = destination::import(destination, name);
+    let imported = destination::import(destinations, name);
     drop(operation_lock);
     match imported {
         Ok(report) => {
-            info!(%destination, archive = report.name, size = report.size, "imported an old archive");
-            runner.state.clear_import_failure(destination, name)?;
+            info!(
+                archive = report.name,
+                size = report.size,
+                destinations = destinations.len(),
+                "imported an old archive"
+            );
+            for destination in destinations {
+                runner.state.clear_import_failure(destination, name)?;
+            }
         }
         Err(import_error) => {
             let message = format!("{import_error:#}");
-            error!(%destination, archive = name, error = %message, "could not import an old archive; it is kept as it is");
-            runner
-                .state
-                .record_import_failure(destination, name, &message)?;
+            error!(archive = name, error = %message, "could not import an old archive; it is kept as it is");
+            for destination in destinations {
+                runner
+                    .state
+                    .record_import_failure(destination, name, &message)?;
+            }
         }
     }
     Ok(())
+}
+
+fn created(name: &str) -> Option<DateTime<Utc>> {
+    parse_archive_name(name).map(|parsed| parsed.created)
 }
