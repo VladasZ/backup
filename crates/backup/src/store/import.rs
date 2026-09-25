@@ -11,7 +11,6 @@ use blake3::Hasher;
 use chrono::{DateTime, Utc};
 use lz4_flex::frame::FrameDecoder;
 use serde::{Deserialize, Serialize};
-use tracing::info;
 
 use super::Store;
 use super::digest::Digest;
@@ -101,7 +100,6 @@ pub fn import_legacy(store: Store, name: &str) -> Result<(Store, ImportReport)> 
     remove_if_present(&path)?;
     remove_if_present(&checksum_path)?;
     sync_directory(store.root())?;
-    info!(archive = name, destination = %store.root().display(), "imported an old archive");
     Ok((
         store,
         ImportReport {
