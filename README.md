@@ -638,8 +638,11 @@ indefinitely by copying the backup from a destination that has it:
 - Later retries every hour.
 
 Retention removes recipes, then a cleanup deletes packs that no recipe uses
-and rewrites packs whose live share has fallen below 70 percent. Packs younger
-than one hour are left alone, since a run may still be writing them.
+and rewrites packs whose live share has fallen below 70 percent. Cleanup runs
+after every delivery, also for jobs without retention. A chunk stored in more
+than one pack counts in only one of them, so extra copies are freed too, but
+only after the kept copy was read back intact. Packs younger than one hour are
+left alone, since a run may still be writing them.
 
 A remote that accepts the SSH connection but then stops making progress cannot
 stall the queue. When no data moves for 15 minutes, the connection is

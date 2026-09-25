@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use tracing::{info, warn};
 
@@ -25,8 +25,10 @@ const REPACK_LIVE_PERCENT: u64 = 70;
 const MAX_INDEX_FILES: usize = 16;
 
 pub fn apply_retention(store: Store, job: &BackupJob) -> Result<Store> {
+    // Cleanup also runs for a job that keeps everything, since an interrupted
+    // run can still leave packs that no backup uses.
     let Some(retention) = &job.retention else {
-        return Ok(store);
+        return collect_garbage(store);
     };
     let recipes = store.list_recipes(Some(&job.name))?;
     let created: Vec<_> = recipes.iter().map(|recipe| recipe.created).collect();
@@ -46,6 +48,11 @@ pub fn apply_retention(store: Store, job: &BackupJob) -> Result<Store> {
 /// Deletes packs no recipe uses and rewrites packs that are mostly unused.
 /// Every recipe in the folder counts, whatever job wrote it, since jobs can
 /// share a destination and its chunks.
+///
+/// A chunk stored in several packs, for example by two writers that ran at
+/// once, counts only in one of them, its keeper, so the extra copies are freed
+/// like unused data. A copy is dropped only after the keeper's copy was read
+/// back intact.
 pub fn collect_garbage(mut store: Store) -> Result<Store> {
     let mut live = HashSet::new();
     for name in store.recipe_names()? {
@@ -60,6 +67,7 @@ pub fn collect_garbage(mut store: Store) -> Result<Store> {
     let mut sparse = Vec::new();
     {
         let index = store.index()?;
+        let keeper = |id: &Digest| index.packs_of(id).into_iter().min();
         for pack in index.packs() {
             if !modified_before(&pack_path(&root, &pack.id), cutoff)? {
                 continue;
@@ -72,7 +80,7 @@ pub fn collect_garbage(mut store: Store) -> Result<Store> {
             let used: u64 = pack
                 .entries
                 .iter()
-                .filter(|entry| live.contains(&entry.id))
+                .filter(|entry| live.contains(&entry.id) && keeper(&entry.id) == Some(pack.id))
                 .map(|entry| u64::from(entry.stored))
                 .sum();
             if used == 0 {
@@ -86,43 +94,38 @@ pub fn collect_garbage(mut store: Store) -> Result<Store> {
         return Ok(store);
     }
 
-    let mut retired = dead;
-    let rewrite: HashSet<Digest> = sparse.iter().copied().collect();
+    let mut retired = Vec::new();
     let mut writer = store.into_writer();
-    for pack in sparse {
+    for pack in dead.into_iter().chain(sparse) {
         let entries = writer
             .store
             .index()?
             .entries(&pack)
             .map(<[_]>::to_vec)
             .unwrap_or_default();
-        let payload = match read_pack(&pack_path(&root, &pack), pack) {
-            Ok(payload) => payload,
-            Err(error) => {
-                warn!(%pack, error = %format!("{error:#}"), "cannot rewrite a damaged pack; verify will repair it");
-                continue;
-            }
-        };
-        let mut intact = true;
+        let mut payload = None;
+        let mut safe = true;
         for entry in entries.iter().filter(|entry| live.contains(&entry.id)) {
-            let elsewhere = writer
-                .store
-                .index()?
-                .packs_of(&entry.id)
-                .iter()
-                .any(|other| *other != pack && !rewrite.contains(other));
-            if elsewhere {
+            let keeper = writer.store.index()?.packs_of(&entry.id).into_iter().min();
+            if keeper != Some(pack) && writer.store.read_chunk_from(keeper, &entry.id).is_ok() {
                 continue;
             }
-            match extract(&payload, entry) {
-                Ok(bytes) => writer.put(&entry.id, &bytes)?,
-                Err(error) => {
-                    warn!(%pack, error = %format!("{error:#}"), "cannot rewrite a damaged chunk; verify will repair it");
-                    intact = false;
+            if payload.is_none() {
+                payload = Some(read_pack(&pack_path(&root, &pack), pack));
+            }
+            let copied = match payload.as_ref() {
+                Some(Ok(payload)) => {
+                    extract(payload, entry).and_then(|bytes| writer.put(&entry.id, &bytes))
                 }
+                Some(Err(error)) => Err(anyhow!("{error:#}")),
+                None => Err(anyhow!("pack {pack} was not read")),
+            };
+            if let Err(error) = copied {
+                warn!(%pack, error = %format!("{error:#}"), "cannot move a chunk out of a pack; verify will repair it");
+                safe = false;
             }
         }
-        if intact {
+        if safe {
             retired.push(pack);
         }
     }

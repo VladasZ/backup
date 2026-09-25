@@ -95,6 +95,12 @@ impl Store {
         )
     }
 
+    /// The chunk read from one given pack, checked against its hash.
+    pub fn read_chunk_from(&mut self, pack: Option<Digest>, chunk: &Digest) -> Result<Vec<u8>> {
+        let pack = pack.with_context(|| format!("no pack holds chunk {chunk}"))?;
+        self.chunk_from(pack, chunk)
+    }
+
     fn chunk_from(&mut self, pack: Digest, chunk: &Digest) -> Result<Vec<u8>> {
         if self.cached.as_ref().is_none_or(|(id, _)| *id != pack) {
             self.cached = None;

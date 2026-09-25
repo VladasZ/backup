@@ -378,3 +378,32 @@ fn an_old_archive_that_fails_its_checksum_is_kept() {
     );
     assert!(!Store::open(&root).unwrap().has_recipe(&name));
 }
+
+#[test]
+fn cleanup_frees_duplicate_packs_from_two_writers_and_keeps_every_chunk() {
+    let temporary = tempdir().unwrap();
+    let data = noise(3 * 1024 * 1024, 12);
+    let source = source_with(temporary.path(), &[("a.bin", data.clone())]);
+    let root = temporary.path().join("dest");
+    let (store, recipe) = backup(Store::open(&root).unwrap(), &source, "docs");
+    // A second writer that did not see the first one's chunks.
+    let mut writer = store.into_writer();
+    for chunk in &recipe.chunks {
+        let bytes = Store::open(&root).unwrap().read_chunk(&chunk.id).unwrap();
+        writer.put(&chunk.id, &bytes).unwrap();
+    }
+    drop(writer.finish().unwrap());
+    let doubled = stored_bytes(&root);
+    age_packs(&root);
+
+    let mut store = collect_garbage(Store::open(&root).unwrap()).unwrap();
+
+    assert!(
+        stored_bytes(&root) * 10 < doubled * 6,
+        "the duplicate copy was not freed"
+    );
+    assert!(check_store(&mut store).unwrap().is_clean());
+    let target = temporary.path().join("restored");
+    restore(&mut store, &recipe, &target);
+    assert_eq!(fs::read(target.join("a.bin")).unwrap(), data);
+}
