@@ -1,16 +1,18 @@
 use std::collections::HashMap;
 use std::env::current_exe;
 use std::fs::File;
-use std::io::{BufReader, Write, copy};
+use std::io::{BufReader, Read, Write, copy};
 use std::path::Path;
-use std::process::Stdio;
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::process::{Child, Stdio};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::thread;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use blake3::Hasher;
 use tracing::info;
 
 use super::session::ssh_base;
+use super::stall::{Stall, wait_child};
 use crate::location::SshLocation;
 
 const REMOTE_DIRECTORY: &str = ".cache/backup";
@@ -77,16 +79,30 @@ fn fingerprint(binary: &Path) -> Result<String> {
     Ok(hex[..16].to_owned())
 }
 
+// Both steps run under the stall watchdog like every other connection. A
+// remote that accepts SSH and then hangs would otherwise hold the serial queue
+// until the connection dies, which can be never.
 fn runs_on_remote(remote: &SshLocation, path: &str) -> Result<bool> {
-    let status = ssh_base(remote)
+    let child = ssh_base(remote)
         .args([path, "--version"])
         // The probe must not read the caller's input, which for the daemon is
         // the stream a session is about to use.
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .spawn()
         .with_context(|| format!("try the backup agent on {}", remote.host))?;
+    let child = Arc::new(Mutex::new(child));
+    let stall = Stall::arm(&child);
+    let status = wait_child(&child)?;
+    stall.disarm();
+    if stall.fired() {
+        bail!(
+            "try the backup agent on {}: {}",
+            remote.host,
+            stall.message()
+        );
+    }
     Ok(status.success())
 }
 
@@ -99,10 +115,10 @@ fn upload(remote: &SshLocation, binary: &Path, path: &str) -> Result<()> {
     let script = format!(
         "set -e; mkdir -p $HOME/{REMOTE_DIRECTORY}; cat > {partial}; chmod 700 {partial}; mv {partial} {path}"
     );
-    let mut child = ssh_base(remote)
+    let mut child: Child = ssh_base(remote)
         .args(["sh", "-c", &single_quote(&script)])
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
+        .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("copy the backup agent to {}", remote.host))?;
@@ -110,21 +126,53 @@ fn upload(remote: &SshLocation, binary: &Path, path: &str) -> Result<()> {
         .stdin
         .take()
         .context("the copy command has no standard input")?;
-    let mut file = BufReader::new(
-        File::open(binary)
-            .with_context(|| format!("read the backup binary {}", binary.display()))?,
-    );
-    let sent = copy(&mut file, &mut stdin).and_then(|written| stdin.flush().map(|()| written));
+    let mut stderr = child
+        .stderr
+        .take()
+        .context("the copy command has no standard error")?;
+    let errors = thread::spawn(move || {
+        let mut message = String::new();
+        stderr.read_to_string(&mut message).map(|_| message)
+    });
+    let child = Arc::new(Mutex::new(child));
+    let stall = Stall::arm(&child);
+    let sent = (|| -> Result<()> {
+        let mut file = BufReader::new(
+            File::open(binary)
+                .with_context(|| format!("read the backup binary {}", binary.display()))?,
+        );
+        let mut buffer = vec![0; 256 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            stdin.write_all(&buffer[..read])?;
+            stall.bump();
+        }
+        stdin.flush()?;
+        Ok(())
+    })();
     drop(stdin);
-    let output = child
-        .wait_with_output()
-        .context("wait for the agent copy to finish")?;
-    sent.with_context(|| format!("send the backup agent to {}", remote.host))?;
-    if !output.status.success() {
+    let status = wait_child(&child)?;
+    stall.disarm();
+    let message = errors
+        .join()
+        .map_err(|_| anyhow!("the stderr reader panicked"))?
+        .context("read the copy command's errors")?;
+    if stall.fired() {
         bail!(
             "copy the backup agent to {}: {}",
             remote.host,
-            String::from_utf8_lossy(&output.stderr).trim()
+            stall.message()
+        );
+    }
+    sent.with_context(|| format!("send the backup agent to {}", remote.host))?;
+    if !status.success() {
+        bail!(
+            "copy the backup agent to {}: {}",
+            remote.host,
+            message.trim()
         );
     }
     Ok(())

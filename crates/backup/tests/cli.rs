@@ -110,17 +110,20 @@ fn cron_half_a_day_ago() -> String {
     format!("0 {hour} * * *")
 }
 
+// A backup is a recipe in the destination's recipes folder, named after the
+// archive it rebuilds.
 fn archives(destination: &Path) -> Vec<String> {
-    let Ok(entries) = fs::read_dir(destination) else {
+    let Ok(entries) = fs::read_dir(destination.join("recipes")) else {
         return Vec::new();
     };
     let mut names: Vec<String> = entries
-        .map(|entry| {
-            entry
+        .filter_map(|entry| {
+            let name = entry
                 .expect("read destination entry")
                 .file_name()
                 .to_string_lossy()
-                .into_owned()
+                .into_owned();
+            name.strip_suffix(".recipe").map(str::to_owned)
         })
         .filter(|name| name.ends_with(".tar.lz4"))
         .collect();
@@ -464,5 +467,79 @@ fn a_configuration_with_no_jobs_is_accepted() {
     assert_eq!(
         String::from_utf8_lossy(&listed.stdout).trim(),
         "no archives found"
+    );
+}
+
+#[test]
+fn export_writes_a_file_that_opens_without_this_tool() {
+    let sandbox = Sandbox::new();
+    fs::write(sandbox.source().join("keep.txt"), "keep me").expect("write source file");
+    sandbox.write_config(&job_config("documents", &sandbox, "0 2 * * *", ""));
+    sandbox.run(&["run", "documents"]);
+
+    let file = sandbox.path("export.tar.lz4");
+    sandbox.run(&[
+        "export",
+        "documents",
+        "--to",
+        file.to_str().expect("export path is valid UTF-8"),
+    ]);
+
+    let unpacked = sandbox.path("unpacked");
+    tar::Archive::new(lz4_flex::frame::FrameDecoder::new(
+        fs::File::open(&file).expect("open the export"),
+    ))
+    .unpack(&unpacked)
+    .expect("unpack the export");
+    assert_eq!(
+        fs::read_to_string(unpacked.join("keep.txt")).expect("read the unpacked file"),
+        "keep me"
+    );
+}
+
+#[test]
+fn the_daemon_imports_old_archives_and_removes_them() {
+    let sandbox = Sandbox::new();
+    fs::write(sandbox.source().join("old.txt"), "from the old format").expect("write source file");
+    let name = "documents-20260101T020000Z-00000000-0000-0000-0000-000000000000.tar.lz4";
+    let mut builder = tar::Builder::new(lz4_flex::frame::FrameEncoder::new(Vec::new()));
+    builder
+        .append_dir_all(".", sandbox.source())
+        .expect("build the old archive");
+    let bytes = builder
+        .into_inner()
+        .expect("finish the tar")
+        .finish()
+        .expect("finish the lz4 frame");
+    let old = sandbox.destination().join(name);
+    fs::write(&old, &bytes).expect("write the old archive");
+    fs::write(
+        sandbox.destination().join(format!("{name}.blake3")),
+        format!("{}  {name}\n", blake3::hash(&bytes).to_hex()),
+    )
+    .expect("write the checksum file");
+    sandbox.write_config(&job_config("documents", &sandbox, "0 2 * * *", ""));
+
+    let daemon = Daemon::start(&sandbox);
+    let deadline = Instant::now() + ARCHIVE_WAIT;
+    while old.exists() && Instant::now() < deadline {
+        sleep(Duration::from_millis(100));
+    }
+    drop(daemon);
+
+    assert!(!old.exists(), "the old archive was not imported");
+    assert!(archives(&sandbox.destination()).contains(&name.to_owned()));
+    let restored = sandbox.path("restored");
+    sandbox.run(&[
+        "restore",
+        "documents",
+        name,
+        "--to",
+        restored.to_str().expect("restore path is valid UTF-8"),
+        "--yes",
+    ]);
+    assert_eq!(
+        fs::read_to_string(restored.join("old.txt")).expect("read the restored file"),
+        "from the old format"
     );
 }

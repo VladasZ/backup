@@ -14,6 +14,7 @@ use tracing::{error, info, warn};
 
 use crate::config::{BackupJob, Config};
 use crate::lock::AppLock;
+use crate::maintenance::Maintenance;
 use crate::paths::AppPaths;
 use crate::runner::Runner;
 use crate::state::BackupRetry;
@@ -44,12 +45,13 @@ pub fn run(config: Config, paths: AppPaths) -> Result<()> {
         .with_context(|| format!("watch configuration directory {}", watch_path.display()))?;
 
     let mut runner = Runner::new(config, paths)?;
-    runner.recover_staging()?;
     info!(config = %runner.paths.config.display(), "backup daemon started");
     let mut next_delivery_check = Utc::now();
     let mut last_purge: Option<DateTime<Utc>> = None;
     let mut jobs_retry_at: Option<DateTime<Utc>> = None;
     let mut schedule_cache: HashMap<String, JobSchedule> = HashMap::new();
+    let mut maintenance = Maintenance::default();
+    let mut maintenance_retry_at: Option<DateTime<Utc>> = None;
     while !stopping.load(Ordering::SeqCst) {
         let now = Utc::now();
         if last_purge.is_none_or(|last| now - last >= ChronoDuration::hours(PURGE_INTERVAL_HOURS)) {
@@ -67,9 +69,13 @@ pub fn run(config: Config, paths: AppPaths) -> Result<()> {
         if stopping.load(Ordering::SeqCst) {
             break;
         }
+        let mut busy = false;
         if jobs_retry_at.is_none_or(|at| now >= at) {
             match run_due_jobs(&mut runner, &stopping, &mut schedule_cache) {
-                Ok(true) => next_delivery_check = next_check(&runner),
+                Ok(true) => {
+                    busy = true;
+                    next_delivery_check = next_check(&runner);
+                }
                 Ok(false) => {}
                 // A state database error must not kill the daemon. The pause
                 // keeps a persistent error from rerunning a backup every tick.
@@ -79,6 +85,18 @@ pub fn run(config: Config, paths: AppPaths) -> Result<()> {
                         Some(Utc::now() + ChronoDuration::seconds(STATE_ERROR_RETRY_SECONDS));
                 }
             }
+        }
+        // Verify and import only run while no backup or delivery is due, one
+        // step per loop, so scheduled work never waits for more than a step.
+        if !busy
+            && !stopping.load(Ordering::SeqCst)
+            && next_delivery_check > Utc::now()
+            && maintenance_retry_at.is_none_or(|at| now >= at)
+            && let Err(error) = maintenance.step(&mut runner, now)
+        {
+            error!(error = %format!("{error:#}"), "maintenance step failed; retrying in a minute");
+            maintenance_retry_at =
+                Some(Utc::now() + ChronoDuration::seconds(STATE_ERROR_RETRY_SECONDS));
         }
 
         match receiver.recv_timeout(LOOP_INTERVAL) {

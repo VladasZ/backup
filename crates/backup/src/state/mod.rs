@@ -18,12 +18,15 @@ use crate::location::Location;
 
 pub use records::{
     BackupRetry, CompletedRun, DeliveryResult, DeliveryStatus, ForgottenRun, HistoryLine,
-    PendingDelivery, StatusLine,
+    ImportFailure, PendingDelivery, StatusLine,
 };
-use records::{DeliveryRecord, RetryRecord, RunRecord};
+use records::{DeliveryRecord, ImportFailureRecord, RetryRecord, RunRecord};
 use redb::ReadableTable;
 
-use store::{DELIVERIES, RETRIES, RUNS, SCHEDULES, Store, decode, deliveries, encode, runs};
+use store::{
+    DELIVERIES, IMPORT_FAILURES, RETRIES, RUNS, SCHEDULES, Store, VERIFIED, VERIFY_PROBLEMS,
+    decode, deliveries, encode, runs,
+};
 
 const RETRY_SECONDS: [i64; 4] = [60, 300, 900, 3600];
 
@@ -51,19 +54,15 @@ impl State {
         &mut self,
         artifact: &Artifact,
         job: &BackupJob,
-        staged: bool,
         results: &[DeliveryResult],
     ) -> Result<Uuid> {
         let run_id = Uuid::new_v4();
         let record = RunRecord {
             job: job.clone(),
             archive_name: artifact.name.clone(),
-            archive_path: artifact.path.clone(),
-            checksum_path: artifact.checksum_path.clone(),
             checksum: artifact.checksum.clone(),
             size: artifact.size,
             created_at: artifact.created_at.timestamp(),
-            staged,
             completed_at: None,
         };
         let now = Utc::now().timestamp();
@@ -78,11 +77,6 @@ impl State {
                     .iter()
                     .find(|result| result.destination == *destination)
                     .map_or(DeliveryStatus::Pending, |result| result.status.clone());
-                // A failed destination with no staged copy cannot be redelivered,
-                // so it gets no delivery row. The scheduler retries the slot.
-                if !staged && matches!(status, DeliveryStatus::Failed(_)) {
-                    continue;
-                }
                 let delivery = match status {
                     DeliveryStatus::Delivered => DeliveryRecord {
                         delivered: true,
@@ -111,18 +105,6 @@ impl State {
             Ok(())
         })?;
         Ok(run_id)
-    }
-
-    pub fn has_archive(&self, path: &Path) -> Result<bool> {
-        self.store.read(|transaction| {
-            for (_, value) in runs(transaction)? {
-                let record: RunRecord = decode(&value)?;
-                if record.archive_path == path {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
-        })
     }
 
     pub fn due_deliveries(&self, now: DateTime<Utc>) -> Result<Vec<PendingDelivery>> {
@@ -172,8 +154,6 @@ impl State {
                     run_id: Uuid::parse_str(&run_id)?,
                     artifact: Artifact {
                         name: record.archive_name,
-                        path: record.archive_path,
-                        checksum_path: record.checksum_path,
                         checksum: record.checksum,
                         size: record.size,
                         created_at: timestamp(record.created_at, "run timestamp")?,
@@ -267,9 +247,6 @@ impl State {
                 }
                 ready.push(CompletedRun {
                     run_id: Uuid::parse_str(&run_id)?,
-                    archive: record.archive_path,
-                    checksum: record.checksum_path,
-                    staged: record.staged,
                 });
             }
             Ok(ready)
@@ -358,9 +335,6 @@ impl State {
                 }
                 forgotten.push(ForgottenRun {
                     archive_name: record.archive_name,
-                    archive: record.archive_path,
-                    checksum: record.checksum_path,
-                    staged: record.staged,
                 });
             }
             if clear_schedule {
@@ -451,6 +425,105 @@ impl State {
         self.store.write(|transaction| {
             transaction.open_table(RETRIES)?.remove(job)?;
             Ok(())
+        })
+    }
+
+    pub fn last_verified(&self, destination: &Location) -> Result<Option<DateTime<Utc>>> {
+        let key = destination.to_string();
+        self.store.read(|transaction| {
+            let table = transaction.open_table(VERIFIED)?;
+            let Some(value) = table.get(key.as_str())? else {
+                return Ok(None);
+            };
+            Ok(Some(timestamp(value.value(), "verify timestamp")?))
+        })
+    }
+
+    pub fn set_last_verified(&self, destination: &Location, value: DateTime<Utc>) -> Result<()> {
+        let key = destination.to_string();
+        self.store.write(|transaction| {
+            transaction
+                .open_table(VERIFIED)?
+                .insert(key.as_str(), value.timestamp())?;
+            Ok(())
+        })
+    }
+
+    /// What the last verify of a destination could not repair, or `None` to
+    /// clear it after a verify that ended clean.
+    pub fn set_verify_problem(&self, destination: &Location, problem: Option<&str>) -> Result<()> {
+        let key = destination.to_string();
+        self.store.write(|transaction| {
+            let mut table = transaction.open_table(VERIFY_PROBLEMS)?;
+            match problem {
+                Some(problem) => {
+                    table.insert(key.as_str(), problem)?;
+                }
+                None => {
+                    table.remove(key.as_str())?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    pub fn verify_problems(&self) -> Result<Vec<(String, String)>> {
+        self.store.read(|transaction| {
+            let table = transaction.open_table(VERIFY_PROBLEMS)?;
+            let mut problems = Vec::new();
+            for entry in table.iter()? {
+                let (key, value) = entry?;
+                problems.push((key.value().to_owned(), value.value().to_owned()));
+            }
+            Ok(problems)
+        })
+    }
+
+    pub fn record_import_failure(
+        &self,
+        destination: &Location,
+        archive: &str,
+        error: &str,
+    ) -> Result<()> {
+        let key = destination.to_string();
+        let record = ImportFailureRecord {
+            error: error.to_owned(),
+            at: Utc::now().timestamp(),
+        };
+        self.store.write(|transaction| {
+            transaction
+                .open_table(IMPORT_FAILURES)?
+                .insert((key.as_str(), archive), encode(&record)?.as_str())?;
+            Ok(())
+        })
+    }
+
+    pub fn clear_import_failure(&self, destination: &Location, archive: &str) -> Result<()> {
+        let key = destination.to_string();
+        self.store.write(|transaction| {
+            transaction
+                .open_table(IMPORT_FAILURES)?
+                .remove((key.as_str(), archive))?;
+            Ok(())
+        })
+    }
+
+    pub fn import_failures(&self) -> Result<Vec<ImportFailure>> {
+        self.store.read(|transaction| {
+            let table = transaction.open_table(IMPORT_FAILURES)?;
+            let mut failures = Vec::new();
+            for entry in table.iter()? {
+                let (key, value) = entry?;
+                let (destination, archive) = key.value();
+                let record: ImportFailureRecord = decode(value.value())?;
+                failures.push(ImportFailure {
+                    destination: destination.to_owned(),
+                    archive: archive.to_owned(),
+                    error: record.error,
+                    at: timestamp(record.at, "import failure timestamp")?,
+                });
+            }
+            Ok(failures)
         })
     }
 

@@ -1,32 +1,35 @@
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write, copy, stdin, stdout};
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead, BufReader, Write, stdin, stdout};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use serde::Serialize;
 use serde_json::{Value, from_str, to_value, to_writer};
-use tracing::{error, info, warn};
+use tracing::error;
 use uuid::Uuid;
 
 use crate::archive::{
-    Artifact, HashingWriter, Sink, SinkId, SourceScanner, Tee, archive_name, create_private,
-    ensure_not_symlink, pump_local, restore_archive, verify_archive, verify_checksum,
-    write_checksum,
+    ChunkEvent, SourceScanner, archive_name, ensure_not_symlink, produce, restore_stream,
 };
 use crate::config::BackupJob;
-use crate::destination::{apply_retention, belongs_to_job, list_local, sweep_stale_partials};
-use crate::location::Location;
+use crate::destination::verify_local;
 use crate::paths::AppPaths;
 use crate::pre;
 use crate::protocol::{
-    AgentRequest, PROTOCOL_VERSION, PingResponse, RESPONSE_PREFIX, ResponseEnvelope, StreamHeader,
-    StreamTrailer, WireArchiveInfo, WireArtifact, copy_frames, write_end_frame, write_frame,
+    AgentRequest, ChunkCount, FrameReader, PROTOCOL_VERSION, PingResponse, RESPONSE_PREFIX, Record,
+    ResponseEnvelope, StreamHeader, StreamTrailer, encode_data, encode_missing, encode_reference,
+    read_ids, read_record, write_end_frame, write_frame, write_ids,
 };
+use crate::store::Store;
+use crate::store::check::{check_store, finish_repair, put_repaired};
+use crate::store::digest::Digest;
+use crate::store::gc::apply_retention;
+use crate::store::import::{import_legacy, legacy_names};
+use crate::store::recipe::Recipe;
 
 pub fn run(paths: &AppPaths) -> Result<()> {
     paths.ensure()?;
-    sweep_stale_partials(&paths.staging);
     let input = stdin();
     let mut reader = BufReader::new(input.lock());
     let mut request_line = String::new();
@@ -34,14 +37,14 @@ pub fn run(paths: &AppPaths) -> Result<()> {
         .read_line(&mut request_line)
         .context("read agent request")?;
     let request: AgentRequest = from_str(&request_line).context("parse agent request")?;
-    if let Err(error) = handle(request, &mut reader, paths) {
+    if let Err(error) = handle(request, &mut reader) {
         error!(%error, "agent operation failed");
         write_error(&format!("{error:#}"))?;
     }
     Ok(())
 }
 
-fn handle(request: AgentRequest, reader: &mut dyn BufRead, paths: &AppPaths) -> Result<()> {
+fn handle(request: AgentRequest, reader: &mut dyn BufRead) -> Result<()> {
     match request {
         AgentRequest::Ping => write_success(&PingResponse {
             protocol: PROTOCOL_VERSION,
@@ -68,45 +71,51 @@ fn handle(request: AgentRequest, reader: &mut dyn BufRead, paths: &AppPaths) -> 
             source,
             exclude,
             pre,
-        } => create_and_stream(job, source, exclude, pre),
-        AgentRequest::Receive {
-            name,
-            destination,
-            job,
-        } => receive_stream(reader, &name, &destination, &job),
-        AgentRequest::List { destination, job } => {
-            let archives = list_local(&destination, &job)?
-                .into_iter()
-                .map(|archive| WireArchiveInfo {
-                    name: archive.name,
-                    checksum: archive.checksum,
-                    size: archive.size,
-                    created: archive.created,
-                })
-                .collect::<Vec<_>>();
-            write_success(&archives)
+        } => create(reader, &job, source, &exclude, pre.as_deref()),
+        AgentRequest::Chunks { destination } => {
+            let ids = Store::open(&destination)?.chunk_ids()?;
+            write_success(&ChunkCount { count: ids.len() })?;
+            let mut output = stdout().lock();
+            write_ids(&mut output, &ids)?;
+            output.flush()?;
+            Ok(())
         }
-        AgentRequest::Send { archive, checksum } => stream_existing(&archive, &checksum),
-        AgentRequest::Restore { artifact, target } => {
-            let temporary =
-                paths
-                    .staging
-                    .join(format!(".restore-{}-{}", Uuid::new_v4(), artifact.name));
-            receive_to_path(reader, &artifact, &temporary)?;
-            let restore_result = restore_archive(&temporary, &target);
-            let cleanup_result = remove_if_present(&temporary);
-            restore_result?;
-            cleanup_result?;
+        AgentRequest::Receive { destination, job } => receive(reader, &destination, &job),
+        AgentRequest::List { destination, job } => {
+            write_success(&Store::open(&destination)?.list_recipes(job.as_deref())?)
+        }
+        AgentRequest::ReadRecipe { destination, name } => {
+            write_success(&Store::open(&destination)?.read_recipe(&name)?)
+        }
+        AgentRequest::ReadChunks { destination } => read_chunks(reader, &destination),
+        AgentRequest::Restore { target } => {
+            let mut frames = FrameReader::new(reader);
+            restore_stream(&mut frames, &target)?;
+            frames.finish()?;
             write_success(&Value::Null)
         }
-        AgentRequest::Verify { archive, checksum } => {
-            verify_checksum(&archive, &checksum)?;
-            verify_archive(&archive)?;
+        AgentRequest::Check { destination } => {
+            write_success(&check_store(&mut Store::open(&destination)?)?)
+        }
+        AgentRequest::Repair {
+            destination,
+            damaged,
+            recipes,
+        } => repair(reader, &destination, &damaged, &recipes),
+        AgentRequest::VerifyArchive { destination, name } => {
+            let mut store = Store::open(&destination)?;
+            let recipe = store.read_recipe(&name)?;
+            verify_local(&mut store, &recipe)?;
             write_success(&Value::Null)
         }
         AgentRequest::Prune { destination, job } => {
-            apply_retention(&destination, &job)?;
+            apply_retention(Store::open(&destination)?, &job)?;
             write_success(&Value::Null)
+        }
+        AgentRequest::Legacy { destination } => write_success(&legacy_names(&destination)?),
+        AgentRequest::Import { destination, name } => {
+            let (_, report) = import_legacy(Store::open(&destination)?, &name)?;
+            write_success(&report)
         }
     }
 }
@@ -126,171 +135,116 @@ fn validate_destination_path(path: &Path) -> Result<()> {
     fs::remove_file(&probe).with_context(|| format!("remove write probe {}", probe.display()))
 }
 
-struct FrameSink;
-
-impl Sink for FrameSink {
-    fn id(&self) -> SinkId {
-        SinkId::Stream
-    }
-
-    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
-        write_frame(&mut stdout().lock(), bytes)
-    }
-
-    fn finish(self: Box<Self>, _checksum: &str, _size: u64) -> Result<()> {
-        let mut output = stdout().lock();
-        write_end_frame(&mut output)?;
-        output.flush()?;
-        Ok(())
-    }
-
-    fn abort(self: Box<Self>) -> Option<String> {
-        let mut output = stdout().lock();
-        if let Err(error) = write_end_frame(&mut output).and_then(|()| output.flush()) {
-            warn!(%error, "could not close the archive stream");
-        }
-        None
-    }
-}
-
-fn create_and_stream(
-    name: String,
+fn create(
+    reader: &mut dyn BufRead,
+    job: &str,
     source: PathBuf,
-    exclude: Vec<String>,
-    pre: Option<String>,
+    exclude: &[String],
+    pre: Option<&str>,
 ) -> Result<()> {
-    if let Some(command) = &pre {
-        pre::run(&name, command)?;
+    let mut known = read_ids(reader)?.into_iter().collect();
+    if let Some(command) = pre {
+        pre::run(job, command)?;
     }
-    let scanner = SourceScanner::new(&source, &exclude)?;
+    let scanner = SourceScanner::new(&source, exclude)?;
     let created_at = Utc::now();
-    let archive = archive_name(&name, created_at);
-    let job = BackupJob {
-        name,
-        source: Location::Local(source),
-        destinations: vec![Location::Local(PathBuf::from("/"))],
-        cron: "0 0 * * *".to_owned(),
-        retention: None,
-        // The pre command already ran above, before the scan.
-        pre: None,
-        exclude,
-    };
     write_success(&StreamHeader {
-        name: archive,
+        name: archive_name(job, created_at),
         created_at,
     })?;
-    let outcome = pump_local(&job, &scanner, Tee::new(vec![Box::new(FrameSink)]))?;
-    if let Some(failed) = outcome.sinks.iter().find(|sink| sink.error.is_some()) {
-        bail!("{failed}");
-    }
+    let produced = produce(job, &scanner, &mut known, &mut |event| {
+        let record = match event {
+            ChunkEvent::Data { id, bytes } => encode_data(&id, bytes)?,
+            ChunkEvent::Reference { id, size } => encode_reference(&id, size),
+        };
+        write_frame(&mut stdout().lock(), &record)?;
+        Ok(())
+    });
+    // The end frame goes out even after a failure, so the controller reads a
+    // complete frame stream followed by the error line.
+    let mut output = stdout().lock();
+    write_end_frame(&mut output)?;
+    output.flush()?;
+    drop(output);
+    let produced = produced?;
     write_success(&StreamTrailer {
-        checksum: outcome.checksum,
-        size: outcome.size,
-        changed: outcome.changed,
+        checksum: produced.checksum,
+        size: produced.size,
+        changed: produced.changed,
     })
 }
 
-fn stream_existing(archive: &Path, checksum: &str) -> Result<()> {
-    verify_checksum(archive, checksum)?;
-    let metadata = fs::metadata(archive)?;
-    let name = archive
-        .file_name()
-        .context("archive has no file name")?
-        .to_string_lossy()
-        .into_owned();
-    let artifact = Artifact {
-        name,
-        path: archive.to_path_buf(),
-        checksum_path: PathBuf::new(),
-        checksum: checksum.to_owned(),
-        size: metadata.len(),
-        created_at: metadata.modified()?.into(),
-    };
-    let mut file = File::open(&artifact.path)?;
-    let wire = WireArtifact::from_artifact(&artifact);
-    write_success(&wire)?;
-    let mut output = stdout().lock();
-    let copied = copy(&mut file, &mut output)?;
-    if copied != wire.size {
+fn receive(reader: &mut dyn BufRead, destination: &Path, job: &BackupJob) -> Result<()> {
+    let mut writer = Store::open(destination)?.into_writer();
+    {
+        let mut frames = FrameReader::new(reader);
+        while let Some(record) = read_record(&mut frames)? {
+            match record {
+                Record::Data { id, bytes } => writer.put(&id, &bytes)?,
+                Record::Reference { id, .. } | Record::Missing { id } => {
+                    bail!("expected chunk data, got a bare reference to {id}")
+                }
+            }
+        }
+    }
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let recipe: Recipe = from_str(&line).context("parse the recipe")?;
+    if recipe.job != job.name {
         bail!(
-            "archive changed while streaming: expected {} bytes, sent {copied}",
-            wire.size
+            "recipe {} belongs to job {:?}, not {:?}",
+            recipe.name,
+            recipe.job,
+            job.name
         );
     }
+    let mut store = writer.finish()?;
+    store.ensure_complete(&recipe)?;
+    store.write_recipe(&recipe)?;
+    apply_retention(store, job)?;
+    write_success(&Value::Null)
+}
+
+fn read_chunks(reader: &mut dyn BufRead, destination: &Path) -> Result<()> {
+    let ids = read_ids(reader)?;
+    let mut store = Store::open(destination)?;
+    write_success(&Value::Null)?;
+    for id in &ids {
+        let record = match store.read_chunk(id) {
+            Ok(bytes) => encode_data(id, &bytes)?,
+            Err(error) => {
+                error!(error = %format!("{error:#}"), "cannot read a requested chunk");
+                encode_missing(id)
+            }
+        };
+        write_frame(&mut stdout().lock(), &record)?;
+    }
+    let mut output = stdout().lock();
+    write_end_frame(&mut output)?;
     output.flush()?;
     Ok(())
 }
 
-fn receive_stream(
+fn repair(
     reader: &mut dyn BufRead,
-    name: &str,
     destination: &Path,
-    job: &BackupJob,
+    damaged: &[Digest],
+    recipes: &[Recipe],
 ) -> Result<()> {
-    if !belongs_to_job(name, &job.name) {
-        bail!(
-            "archive name {name:?} does not belong to job {:?}",
-            job.name
-        );
-    }
-    fs::create_dir_all(destination)
-        .with_context(|| format!("create destination {}", destination.display()))?;
-    sweep_stale_partials(destination);
-    let partial = destination.join(format!(".{name}-{}.partial", Uuid::new_v4()));
-    let received = (|| {
-        let file = create_private(&partial)?;
-        let mut writer = HashingWriter::new(file);
-        let size = copy_frames(reader, &mut writer)?;
-        writer.inner.sync_all()?;
-        let mut line = String::new();
-        reader.read_line(&mut line)?;
-        let trailer: StreamTrailer = from_str(&line).context("parse stream trailer")?;
-        let checksum = writer.checksum();
-        if trailer.checksum != checksum || trailer.size != size {
-            bail!(
-                "received {size} bytes {checksum}, expected {} bytes {}",
-                trailer.size,
-                trailer.checksum
-            );
+    let mut writer = Store::open(destination)?.into_writer();
+    {
+        let mut frames = FrameReader::new(reader);
+        while let Some(record) = read_record(&mut frames)? {
+            match record {
+                Record::Data { id, bytes } => put_repaired(&mut writer, &id, &bytes)?,
+                Record::Reference { id, .. } | Record::Missing { id } => {
+                    bail!("expected a repaired chunk, got a bare reference to {id}")
+                }
+            }
         }
-        Ok(checksum)
-    })();
-    let checksum = match received {
-        Ok(checksum) => checksum,
-        Err(error) => {
-            remove_if_present(&partial)?;
-            return Err(error);
-        }
-    };
-    let target = destination.join(name);
-    if target.exists() && verify_checksum(&target, &checksum).is_ok() {
-        info!(path = %target.display(), "destination already holds this archive");
-        remove_if_present(&partial)?;
-    } else {
-        fs::rename(&partial, &target)?;
     }
-    write_checksum(&target, &checksum)?;
-    File::open(destination)?.sync_all()?;
-    apply_retention(destination, job)?;
+    finish_repair(writer.finish()?, damaged, recipes)?;
     write_success(&Value::Null)
-}
-
-fn receive_to_path(reader: &mut dyn BufRead, artifact: &WireArtifact, path: &Path) -> Result<()> {
-    remove_if_present(path)?;
-    let receive_result = (|| {
-        let mut file = create_private(path)?;
-        let copied = copy(&mut reader.take(artifact.size), &mut file)?;
-        file.flush()?;
-        file.sync_all()?;
-        if copied != artifact.size {
-            bail!("received {copied} bytes, expected {}", artifact.size);
-        }
-        verify_checksum(path, &artifact.checksum)
-    })();
-    if receive_result.is_err() {
-        remove_if_present(path)?;
-    }
-    receive_result
 }
 
 fn write_success<T: Serialize>(data: &T) -> Result<()> {
@@ -318,12 +272,4 @@ fn write_response(response: &ResponseEnvelope) -> Result<()> {
     writeln!(output)?;
     output.flush()?;
     Ok(())
-}
-
-fn remove_if_present(path: &Path) -> Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
-    }
 }

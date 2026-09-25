@@ -13,6 +13,11 @@ pub const DELIVERIES: TableDefinition<'static, (&str, &str), &str> =
     TableDefinition::new("deliveries");
 pub const SCHEDULES: TableDefinition<'static, &str, i64> = TableDefinition::new("schedules");
 pub const RETRIES: TableDefinition<'static, &str, &str> = TableDefinition::new("retries");
+pub const VERIFIED: TableDefinition<'static, &str, i64> = TableDefinition::new("verified");
+pub const VERIFY_PROBLEMS: TableDefinition<'static, &str, &str> =
+    TableDefinition::new("verify_problems");
+pub const IMPORT_FAILURES: TableDefinition<'static, (&str, &str), &str> =
+    TableDefinition::new("import_failures");
 
 // redb allows one open handle per database, so the daemon and the CLI commands cannot both
 // keep it open. Every operation takes a lock, opens the file, works, and closes it again.
@@ -34,6 +39,9 @@ impl Store {
         transaction.open_table(DELIVERIES)?;
         transaction.open_table(SCHEDULES)?;
         transaction.open_table(RETRIES)?;
+        transaction.open_table(VERIFIED)?;
+        transaction.open_table(IMPORT_FAILURES)?;
+        transaction.open_table(VERIFY_PROBLEMS)?;
         transaction.commit()?;
         drop(database);
         drop(lock);

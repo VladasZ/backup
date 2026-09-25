@@ -29,7 +29,7 @@ fn backup(root: &Path, arguments: &[&str]) -> Output {
 }
 
 #[test]
-fn a_stalled_remote_is_disconnected_and_kept_for_retry() {
+fn a_stalled_remote_is_disconnected_and_fails_the_run() {
     let sandbox = tempfile::tempdir().expect("create sandbox");
     let root = sandbox.path();
     for directory in ["home", "state", "source", "bin"] {
@@ -67,19 +67,11 @@ cron = "0 2 * * *"
         "the stalled remote was not disconnected within {STALL_BOUND:?}"
     );
     assert!(
-        output.status.success(),
-        "a stalled remote should be staged for retry, not fail the run:\n{stderr}"
+        !output.status.success(),
+        "a run whose only destination stalled must fail, so the slot is retried:\n{stderr}"
     );
     assert!(
         stderr.contains("made no progress"),
         "the stall reason was lost: {stderr}"
-    );
-
-    let status = backup(root, &["status"]);
-    assert!(status.status.success());
-    let status = String::from_utf8_lossy(&status.stdout);
-    assert!(
-        status.contains("1 destination(s) pending"),
-        "the stalled delivery was not kept for retry:\n{status}"
     );
 }

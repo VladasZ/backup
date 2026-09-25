@@ -138,29 +138,43 @@ pub struct SshStream {
     output: BufReader<ChildStdout>,
     stderr: Option<JoinHandle<Result<String>>>,
     stall: Arc<Stall>,
+    writer: Option<JoinHandle<Result<()>>>,
 }
 
 impl SshStream {
-    pub fn spawn(remote: &SshLocation, request: &AgentRequest) -> Result<Self> {
+    /// Sends the request and `payload`, the frames some requests carry, then
+    /// closes stdin and leaves stdout to the caller.
+    pub fn spawn(remote: &SshLocation, request: &AgentRequest, payload: &[u8]) -> Result<Self> {
         let mut child = ssh_command(remote)?
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
         let stderr = drain_stderr(&mut child)?;
-        {
-            let mut input = child.stdin.take().context("SSH stdin is unavailable")?;
-            write_request(&mut input, request)?;
-        }
         let output = child.stdout.take().context("SSH stdout is unavailable")?;
+        let mut input = child.stdin.take().context("SSH stdin is unavailable")?;
         let child = Arc::new(Mutex::new(child));
         let stall = Stall::arm(&child);
-        Ok(Self {
+        // The payload can be larger than the pipe buffer, and the agent may
+        // answer before it has read all of it, so it is written from a thread.
+        let writer = {
+            let request = request.clone();
+            let payload = payload.to_vec();
+            thread::spawn(move || -> Result<()> {
+                write_request(&mut input, &request)?;
+                input.write_all(&payload)?;
+                input.flush()?;
+                Ok(())
+            })
+        };
+        let stream = Self {
             child,
             output: BufReader::new(output),
             stderr: Some(stderr),
             stall,
-        })
+            writer: Some(writer),
+        };
+        Ok(stream)
     }
 
     pub fn reader(&mut self) -> ProgressReader<'_> {
@@ -173,6 +187,9 @@ impl SshStream {
     pub fn wait(&mut self) -> Result<ExitStatus> {
         let status = wait_child(&self.child)?;
         self.stall.disarm();
+        if let Some(writer) = self.writer.take() {
+            join(writer)?.context("send the request to the agent")?;
+        }
         Ok(status)
     }
 
@@ -180,6 +197,11 @@ impl SshStream {
         self.stall.disarm();
         kill_child(&self.child)?;
         wait_child(&self.child)?;
+        if let Some(writer) = self.writer.take()
+            && let Err(error) = join(writer)?
+        {
+            warn!(error = %format!("{error:#}"), "the request to a terminated agent was not fully sent");
+        }
         Ok(())
     }
 
@@ -279,10 +301,8 @@ pub fn read_response<T: DeserializeOwned>(reader: &mut dyn BufRead) -> Result<T>
         if read == 0 {
             bail!("agent closed the connection without a response");
         }
-        bytes += read;
-        if bytes > 64 * 1024 {
-            bail!("agent response prefix was not found within 64 KiB");
-        }
+        // Only output before the response counts toward the limit, since a
+        // response carrying a recipe can itself be megabytes long.
         if let Some(json) = line.strip_prefix(RESPONSE_PREFIX) {
             let envelope: ResponseEnvelope = from_str(json)?;
             if envelope.protocol == 0 {
@@ -302,6 +322,10 @@ pub fn read_response<T: DeserializeOwned>(reader: &mut dyn BufRead) -> Result<T>
                 )));
             }
             return from_value(envelope.data).context("decode agent response");
+        }
+        bytes += read;
+        if bytes > 64 * 1024 {
+            bail!("agent response prefix was not found within 64 KiB");
         }
     }
 }

@@ -328,17 +328,20 @@ fn backup_ok(sandbox: &Path, arguments: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+// A backup is a recipe in the destination's recipes folder, named after the
+// archive it rebuilds.
 fn local_archives(destination: &Path) -> Vec<String> {
-    let Ok(entries) = fs::read_dir(destination) else {
+    let Ok(entries) = fs::read_dir(destination.join("recipes")) else {
         return Vec::new();
     };
     let mut names: Vec<String> = entries
-        .map(|entry| {
-            entry
+        .filter_map(|entry| {
+            let name = entry
                 .expect("read destination entry")
                 .file_name()
                 .to_string_lossy()
-                .into_owned()
+                .into_owned();
+            name.strip_suffix(".recipe").map(str::to_owned)
         })
         .filter(|name| name.ends_with(".tar.lz4"))
         .collect();
@@ -456,7 +459,7 @@ fn every_combination_of_local_and_ssh_endpoints_round_trips() {
     assert_eq!(local_archives(&root.join("destination")).len(), 2);
     assert_eq!(
         remote
-            .exec("ls /srv/local-ssh/*.tar.lz4 /srv/ssh-ssh/*.tar.lz4 | wc -l")
+            .exec("ls /srv/local-ssh/recipes/*.recipe /srv/ssh-ssh/recipes/*.recipe | wc -l")
             .trim(),
         "2"
     );
@@ -475,8 +478,8 @@ fn every_combination_of_local_and_ssh_endpoints_round_trips() {
     let output = backup(&root, &["run", "rejected"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        output.status.success(),
-        "a single failed remote should be staged for retry, not fail the run:\n{stderr}"
+        !output.status.success(),
+        "a run whose only destination failed must fail, so the slot is retried:\n{stderr}"
     );
     assert!(
         stderr.contains("remote agent error") && stderr.contains("create destination"),
@@ -485,11 +488,6 @@ fn every_combination_of_local_and_ssh_endpoints_round_trips() {
     assert!(
         !stderr.to_lowercase().contains("broken pipe"),
         "broken pipe leaked into the error: {stderr}"
-    );
-    let status = backup_ok(&root, &["status"]);
-    assert!(
-        status.contains("1 destination(s) pending"),
-        "the failed remote delivery was not kept for retry:\n{status}"
     );
 }
 
@@ -524,9 +522,9 @@ fn a_copied_agent_works_without_one_installed() {
     backup_ok(&root, &["validate"]);
     backup_ok(&root, &["run", case.name]);
 
-    let delivered = remote.exec("ls /srv/copied");
+    let delivered = remote.exec("ls /srv/copied/recipes");
     assert!(
-        delivered.contains(".tar.lz4"),
+        delivered.contains(".tar.lz4.recipe"),
         "no archive reached the remote:\n{delivered}"
     );
     let cached = remote.exec("ls $HOME/.cache/backup");

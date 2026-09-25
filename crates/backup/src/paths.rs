@@ -15,7 +15,6 @@ pub struct AppPaths {
     pub database: PathBuf,
     pub daemon_lock: PathBuf,
     pub operation_lock: PathBuf,
-    pub staging: PathBuf,
     pub log_directory: PathBuf,
     pub log_file: PathBuf,
 }
@@ -39,7 +38,6 @@ impl AppPaths {
             database: state.join("state.redb"),
             daemon_lock: state.join("daemon.lock"),
             operation_lock: state.join("operation.lock"),
-            staging: state.join("staging"),
             log_file: log_directory.join("backup.log"),
             log_directory,
             state,
@@ -47,15 +45,11 @@ impl AppPaths {
     }
 
     pub fn ensure(&self) -> Result<()> {
-        for directory in [&self.state, &self.staging, &self.log_directory] {
+        for directory in [&self.state, &self.log_directory] {
             fs::create_dir_all(directory)
                 .with_context(|| format!("create directory {}", directory.display()))?;
         }
         Ok(())
-    }
-
-    pub fn job_staging(&self, job: &str) -> PathBuf {
-        self.staging.join(job)
     }
 }
 

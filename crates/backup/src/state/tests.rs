@@ -25,13 +25,11 @@ fn tracks_each_destination_and_completes_only_after_all_deliveries() {
     };
     let artifact = Artifact {
         name: "documents-archive.tar".to_owned(),
-        path: temporary.path().join("archive.tar"),
-        checksum_path: temporary.path().join("archive.tar.blake3"),
         checksum: "abc".to_owned(),
         size: 12,
         created_at: Utc::now(),
     };
-    let run_id = state.register_run(&artifact, &job, true, &[]).unwrap();
+    let run_id = state.register_run(&artifact, &job, &[]).unwrap();
     let due = state.due_deliveries(Utc::now()).unwrap();
     assert_eq!(due.len(), 2);
     assert!(state.next_due().unwrap().is_some());
@@ -78,8 +76,6 @@ fn registered_results_skip_delivered_destinations_and_retry_failed_ones() {
     };
     let artifact = Artifact {
         name: "documents-archive.tar".to_owned(),
-        path: temporary.path().join("archive.tar"),
-        checksum_path: temporary.path().join("archive.tar.blake3"),
         checksum: "abc".to_owned(),
         size: 12,
         created_at: Utc::now(),
@@ -95,7 +91,7 @@ fn registered_results_skip_delivered_destinations_and_retry_failed_ones() {
         },
     ];
 
-    state.register_run(&artifact, &job, true, &results).unwrap();
+    state.register_run(&artifact, &job, &results).unwrap();
 
     assert!(state.due_deliveries(Utc::now()).unwrap().is_empty());
     let later = Utc::now() + Duration::seconds(61);
@@ -122,8 +118,6 @@ fn completed_runs_show_in_history_until_purged() {
     };
     let artifact = Artifact {
         name: "documents-archive.tar".to_owned(),
-        path: temporary.path().join("archive.tar"),
-        checksum_path: temporary.path().join("archive.tar.blake3"),
         checksum: "abc".to_owned(),
         size: 12,
         created_at: Utc::now(),
@@ -132,12 +126,9 @@ fn completed_runs_show_in_history_until_purged() {
         destination,
         status: DeliveryStatus::Delivered,
     }];
-    state
-        .register_run(&artifact, &job, false, &results)
-        .unwrap();
+    state.register_run(&artifact, &job, &results).unwrap();
     let ready = state.complete_ready_runs().unwrap();
     assert_eq!(ready.len(), 1);
-    assert!(!ready[0].staged);
     state.mark_run_complete(ready[0].run_id).unwrap();
 
     let history = state.history().unwrap();

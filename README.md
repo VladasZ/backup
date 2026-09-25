@@ -1,8 +1,9 @@
 # backup
 
-`backup` is a scheduled backup service for macOS and Linux. It creates
-independent timestamped archives from local or SSH sources and delivers each
-archive to one or more local or SSH directories.
+`backup` is a scheduled backup service for macOS and Linux. It backs up local
+or SSH sources into one or more local or SSH directories. Each directory is a
+deduplicated store: data that did not change since the last backup is not
+stored again.
 
 The configuration is deliberately small: give each job a source, destinations,
 UTC cron schedule, optional retention rule, optional pre command, and optional
@@ -14,13 +15,17 @@ exclusions. There is nothing else to choose.
 - Standard five-field cron schedules evaluated in UTC.
 - Local and SSH sources and destinations.
 - Multiple independent destinations per job.
-- Full TAR archives with UTC timestamps and UUIDs.
-- LZ4 compressed TAR archives, readable by the standard `lz4` tool.
+- Every backup is a full TAR stream with a UTC timestamp and UUID.
+- Content-defined deduplication with FastCDC, so unchanged data is stored once.
+- Chunks named by their BLAKE3 hash and compressed with LZ4.
+- Reed-Solomon parity on every stored file, so small damage heals in place.
+- A weekly full verify that repairs damage from the other destinations.
+- Export of any backup as a plain `.tar.lz4` that opens without this tool.
 - Infinite retention by default, with optional count or age retention.
 - Milestone archives of week, month, and year ages that are always kept.
-- Streaming delivery to every destination at once, no full local copy needed.
-- Staged copy and destination-specific retries when a destination fails.
-- Atomic publication and BLAKE3 checksum files.
+- Streaming delivery to every destination at once, only chunks it lacks.
+- A failed destination is filled later from one that succeeded.
+- Atomic publication of every stored file.
 - Pre/post source catalogs that report files changed during the archive pass.
 - Symbolic links, hard links, metadata, ownership, and extended attributes.
 - Sockets, FIFOs, device files, and unreadable entries are skipped with a warning.
@@ -30,6 +35,7 @@ exclusions. There is nothing else to choose.
 - An optional command run before each archive, for database dumps.
 - Automatic configuration reload.
 - Rotating log files.
+- Automatic import of archives from the old one-file-per-backup format.
 - Pure Rust. No C or C++ source is compiled into the binary.
 
 ## Version 1 scope
@@ -37,8 +43,8 @@ exclusions. There is nothing else to choose.
 Version 1 supports macOS and Linux. It does not support Windows, S3,
 encryption, filesystem snapshots, special files, or nested mounts.
 
-Every backup is a complete independent archive. Restoring one archive never
-requires an older archive.
+Every backup restores on its own. Backups share stored chunks, but no backup
+is stored as a difference against an older one.
 
 ## Install
 
@@ -140,14 +146,14 @@ has a normal state with nothing scheduled yet.
 
 ### Compression
 
-Archives are always LZ4. There is no setting, because measurement did not
+Stored chunks are always LZ4. There is no setting, because measurement did not
 support one. LZ4 compresses at over 500 MiB/s and costs about 1 second of CPU
 per GiB, so it is close to free on any job. Slower algorithms make smaller
 archives on text, but a backup runs unattended every night and the archive
 travels to its destinations, so speed and predictable cost matter more.
 
-Archives are written as `.tar.lz4` and can be opened with the standard `lz4`
-tool without this program.
+`backup export` writes any backup as a `.tar.lz4` file that the standard `lz4`
+and `tar` tools open without this program.
 
 ### Job fields
 
@@ -336,9 +342,10 @@ and uses a temporary file to test destination write access.
 backup run documents
 ```
 
-Every destination is attempted at once. A failed destination leaves the archive
-in staging for retry when a staged copy exists, see below. Commands other than
-`daemon` print their log lines to stderr.
+Every destination is written at once. When at least one destination succeeds,
+a failed one is filled later by copying the backup from a destination that has
+it. When every destination fails, the run fails. Commands other than `daemon`
+print their log lines to stderr.
 
 ### Show pending deliveries
 
@@ -375,10 +382,13 @@ Health exits with code 0 when everything is fine and 1 otherwise, so a cron
 job or monitor can watch it. It reports a problem when the daemon is not
 running, when a job's latest scheduled slot has not completed within one hour,
 when a delivery has been pending for over one hour, or when a job that is no
-longer in the configuration still has pending deliveries. There is no setting
-for the grace period.
+longer in the configuration still has pending deliveries. It also reports a
+destination that has gone more than 8 days without a verify, damage the last
+verify could not repair, an old archive that could not be imported, and a
+newest backup that is less than half the size of the one before it. There is no
+setting for any of these limits.
 
-While a backup, delivery, or restore is running, the grace period is 24 hours
+While a backup, delivery, restore, verify, or import is running, the grace period is 24 hours
 instead of one hour, so a run that takes several hours does not report as a
 problem while it is still moving data. The queue is serial, so jobs waiting
 behind it are covered by the same rule. The report says when an operation is
@@ -439,11 +449,10 @@ target already holds files. Use `--yes` for unattended runs:
 backup restore documents --to /srv/documents --yes
 ```
 
-The checksum and complete archive stream are verified before extraction. If a
-copy has no checksum file, restore asks before using it and still reads the
-whole archive to confirm it is not truncated, and `--yes` accepts this. If one
-destination has a corrupt copy, restore tries another configured destination
-with the same archive. Existing archive paths are overwritten, but unrelated
+Every chunk is checked against its hash as it is read, and the whole stream is
+checked against the backup's BLAKE3 at the end. When a chunk is damaged in one
+destination, restore takes that chunk from another destination that holds the
+same backup. Existing archive paths are overwritten, but unrelated
 files already in the target are not deleted. Ownership is restored only when
 running as root, since only root may change a file's owner.
 
@@ -456,9 +465,28 @@ backup verify documents --archive ARCHIVE_NAME
 backup verify documents --archive latest
 ```
 
-Verification checks BLAKE3 and reads every TAR entry through the selected
-decompressor, locally or through the remote agent. `--archive latest` checks
-only the newest archive, resolved per job.
+Verification reads everything stored in each destination of the selected jobs
+and checks every chunk against its hash. Damage the parity cannot heal is
+repaired from the other destinations, then the destination is read again.
+Because it repairs, verify waits for any running backup. With `--archive`, the
+named backup is also rebuilt from each destination alone and read as a TAR.
+`--archive latest` resolves the newest backup per job.
+
+The daemon runs the same verify on every destination once a week, between
+scheduled backups.
+
+### Export
+
+```sh
+backup export documents --to /tmp/documents.tar.lz4
+backup export documents ARCHIVE_NAME --to /tmp/documents.tar.lz4
+```
+
+Export rebuilds one backup and writes it as a plain `.tar.lz4`:
+
+```sh
+lz4 -dc /tmp/documents.tar.lz4 | tar -x -C /tmp/restored
+```
 
 ### Cancel pending deliveries
 
@@ -466,8 +494,8 @@ only the newest archive, resolved per job.
 backup forget documents
 ```
 
-Forget cancels every pending delivery of one job and deletes its staged
-archives. Archives already delivered stay where they are. For a job that is no
+Forget cancels every pending delivery of one job. Backups already delivered
+stay where they are. For a job that is no
 longer in the configuration it also clears the stored schedule and retry
 state, so nothing is left behind and health stops reporting it.
 
@@ -487,7 +515,8 @@ without retention remain unchanged.
 backup daemon
 ```
 
-SIGINT and SIGTERM stop new work and let the current backup or delivery finish.
+SIGINT and SIGTERM stop new work and let the current backup, delivery, verify,
+or import step finish.
 
 ### JSON output
 
@@ -547,26 +576,47 @@ Linux uses:
 ```
 
 The service runs as the installing user. Uninstall does not remove
-configuration, state, staged data, logs, or destination archives.
+configuration, state, logs, or destination data.
 
-## Archive and delivery behavior
+## Storage and delivery
 
-The archive is a single tar.lz4 stream that is written to every destination at
-the same time while it is being created. Nothing is written to the local disk
-for a job with one local destination. When a job has an SSH destination or more
-than one destination, the same stream is also written to staging so a failed
-destination can be retried from a copy. The staged copy is deleted as soon as
-every destination has the archive. Remote sources stream through the controller
-in the same way, so the remote host never stores a full archive either.
+A backup is the TAR stream of the source, cut into content-defined chunks with
+FastCDC. A cut depends on the bytes around it, not on their offset, so an edit
+changes only the chunks next to it. Chunks average 1 MiB, with a minimum of
+256 KiB and a maximum of 4 MiB. Each chunk is named by its BLAKE3 hash and
+stored once per destination, however many backups use it.
 
-A failed destination is kept for retry only when a staged copy exists. With one
-local destination and no staging, a failure fails the run and the daemon retries
-the whole slot.
+A destination folder holds:
+
+```text
+packs/ab/<blake3>.pack        chunks, about 32 MB per pack
+index/<blake3>.index          which pack holds which chunk
+recipes/<name>.recipe         one per backup, its chunks in order
+```
+
+A recipe also holds the length and BLAKE3 of the whole stream. The index is
+only a cache. A pack that no index file lists is read and indexed again, so
+losing every index file loses nothing. Several jobs may share one destination
+and its chunks.
+
+Every pack, index file and recipe is sealed with parity. The file is cut into
+64 pieces and Reed-Solomon adds 2 parity pieces, about 3 percent more space.
+Each piece has its BLAKE3 in a header that is written at both ends of the file.
+Up to 2 damaged pieces per file are rebuilt in place, without another copy.
+Every file is written under a hidden partial name, synced, and renamed into
+place. The recipe is written last, so a backup exists only once all its chunks
+do.
+
+The source is read once per run and the chunks go to every destination at
+once. Each destination is sent only the chunks it does not hold. From an SSH
+source, only chunks that some destination lacks cross the connection. Every
+chunk that arrives over a connection is checked against its hash before it is
+stored.
 
 Names use this form:
 
 ```text
-<job>-<compact UTC timestamp>-<UUID>.<archive extension>
+<job>-<compact UTC timestamp>-<UUID>.tar.lz4
 ```
 
 For example:
@@ -575,51 +625,46 @@ For example:
 documents-20260717T020000Z-01234567-89ab-cdef-0123-456789abcdef.tar.lz4
 ```
 
-The timestamp has no colons on purpose. Colons are illegal in SMB names, so
-an archive named with RFC3339 shows up mangled over a samba share.
+The name keeps the `.tar.lz4` ending because `export` turns the backup into
+exactly that file. The timestamp has no colons on purpose. Colons are illegal
+in SMB names, so an RFC3339 name shows up mangled over a samba share.
 
-Every archive has a neighboring `.blake3` checksum file. Archives and
-checksum files are written under partial names, synced, verified, and atomically
-renamed into place. The checksum file lets the tool detect a damaged archive
-cheaply without unpacking it, both when a copy arrives and later on demand with
-`backup verify`.
-
-Deleting old archives during retention does not read checksum files. If an
-archive ever loses its checksum file, retention, `list`, and delivery keep
-working. `list` marks such an archive, `verify` reports it and exits with an
-error, and `restore` asks before restoring it without a checksum, still reading
-the whole archive to confirm it is not truncated.
-
-Destinations are independent. Failed destinations retry indefinitely:
+A destination that fails during a run gets a pending delivery. It retries
+indefinitely by copying the backup from a destination that has it:
 
 - First retry after 1 minute.
 - Second retry after 5 minutes.
 - Third retry after 15 minutes.
 - Later retries every hour.
 
-Successful destinations are not sent the same archive again. A corrupt
-destination copy is replaced from staging, and a bad checksum file is
-repaired after the archive itself is verified.
+Retention removes recipes, then a cleanup deletes packs that no recipe uses
+and rewrites packs whose live share has fallen below 70 percent. Packs younger
+than one hour are left alone, since a run may still be writing them.
 
 A remote that accepts the SSH connection but then stops making progress cannot
-stall the queue. When no data moves for 15 minutes during an archive transfer,
-the connection is terminated, that destination is marked failed, and the normal
-retry schedule applies. There is no setting for this.
+stall the queue. When no data moves for 15 minutes, the connection is
+terminated, that destination is marked failed, and the normal retry schedule
+applies. There is no setting for this.
 
-An interrupted transfer can leave a hidden partial file behind. Partial files
-older than one day are deleted automatically during later deliveries and at
-daemon startup. A transfer that is still running is never touched, since its
-partial file keeps a fresh modification time.
+An interrupted write can leave a hidden partial file behind. Partial files
+older than one day are deleted automatically. A write that is still running is
+never touched, since its partial file keeps a fresh modification time.
 
 Removing a job from the configuration does not cancel its recorded pending
 deliveries. Use `backup forget` to cancel them.
 
-Archive and checksum files are created readable only by their owner, so other
-users of a shared destination cannot read backup contents.
+Stored files are created readable only by their owner, so other users of a
+shared destination cannot read backup contents.
 
-On startup, complete staged archives not yet recorded in the state database are verified
-and recovered for matching active jobs. Corrupt staged archives are preserved
-and logged for inspection.
+### Old archives
+
+Older versions stored each backup as one `.tar.lz4` file with a `.blake3` file
+next to it. The daemon imports these on its own, one at a time, oldest first,
+between scheduled backups. Each import reads the file once, checks it against
+its `.blake3`, and stores its chunks. The original is deleted only after the
+stream rebuilt from the store matches it byte for byte and reads as a valid
+TAR. A failed import keeps the original, shows in `backup health`, and is tried
+again after a day.
 
 ## Consistency and filesystem behavior
 
@@ -655,9 +700,8 @@ its own ownership and does not fail on that.
 ## Disk space
 
 There is no free space check before a run, and no warning about a filesystem
-filling up. A destination or staging disk that
-fills up fails only that copy, its partial file is removed, and the other
-copies continue.
+filling up. A destination disk that fills up fails only that destination, and
+the other destinations continue.
 
 ## Runtime files
 
@@ -667,7 +711,7 @@ macOS:
 Configuration:
   ~/Library/Application Support/backup/config.toml
 
-State and staging:
+State:
   ~/Library/Application Support/backup/
 
 Logs:
@@ -681,7 +725,7 @@ Configuration:
   $XDG_CONFIG_HOME/backup/config.toml when XDG_CONFIG_HOME is set
   ~/.config/backup/config.toml otherwise
 
-State and staging:
+State:
   $XDG_STATE_HOME/backup/ when XDG_STATE_HOME is set
   ~/.local/state/backup/ otherwise
 
@@ -691,8 +735,7 @@ Logs:
 
 Logs rotate at 10 MiB and keep nine rotated files plus the current file. Only
 the daemon and the remote agent write to the log file. Other commands log to
-stderr. `RUST_LOG` controls the log filter; the default is `info`. The staging
-path is not configurable.
+stderr. `RUST_LOG` controls the log filter. The default is `info`.
 
 ## Development
 
@@ -731,8 +774,8 @@ backup status
 backup logs --follow
 ```
 
-The archive stays in staging while failed destinations retry. Repair the
-destination or SSH access and leave the daemon running.
+A failed destination retries by copying the backup from another destination.
+Repair the destination or SSH access and leave the daemon running.
 
 ### The log warns that the source changed
 

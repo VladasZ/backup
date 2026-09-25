@@ -9,7 +9,10 @@
 
 use std::collections::{HashMap, HashSet};
 
+use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
+
+use crate::config::RetentionConfig;
 
 const DAY: i64 = 24 * 60 * 60;
 const YEAR_DAYS: i64 = 365;
@@ -55,11 +58,34 @@ pub fn milestone_keepers(created: &[DateTime<Utc>], now: DateTime<Utc>) -> HashS
     keepers.into_values().collect()
 }
 
+/// Indices into `created`, which is sorted newest first, of the backups the
+/// rule removes. Milestone keepers are exempt, so the rule only counts and
+/// removes the rest.
+pub fn retention_removals(
+    created: &[DateTime<Utc>],
+    retention: &RetentionConfig,
+    now: DateTime<Utc>,
+) -> Result<Vec<usize>> {
+    let keepers = milestone_keepers(created, now);
+    let candidates = (0..created.len()).filter(|index| !keepers.contains(index));
+    if let Some(count) = retention.count {
+        return Ok(candidates.skip(count).collect());
+    }
+    let Some(age) = retention.age_duration()? else {
+        return Ok(Vec::new());
+    };
+    let cutoff = now - Duration::from_std(age).context("retention age is too large")?;
+    Ok(candidates
+        .filter(|index| created[*index] < cutoff)
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{Duration, TimeZone, Utc};
 
-    use super::{milestone_bucket, milestone_keepers};
+    use super::{milestone_bucket, milestone_keepers, retention_removals};
+    use crate::config::RetentionConfig;
 
     #[test]
     fn ages_map_to_the_documented_buckets() {
@@ -114,5 +140,39 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 8, 28, 12, 0, 0).unwrap();
         let created = [now, now - Duration::days(3), now - Duration::days(6)];
         assert!(milestone_keepers(&created, now).is_empty());
+    }
+
+    #[test]
+    fn count_retention_spares_one_keeper_per_age_bucket() {
+        let now = Utc::now();
+        let created: Vec<_> = [0, 1, 2, 8, 10, 20, 40, 100, 400, 800]
+            .into_iter()
+            .map(|days| now - Duration::days(days))
+            .collect();
+        let retention = RetentionConfig {
+            count: Some(2),
+            age: None,
+        };
+
+        let removals = retention_removals(&created, &retention, now).unwrap();
+
+        // 0 and 1 survive as the newest two. 10, 20, 40, 100, 400, and 800
+        // are the oldest archives of their buckets. Only 2 and 8 go.
+        assert_eq!(removals, [2, 3]);
+    }
+
+    #[test]
+    fn age_retention_spares_one_keeper_per_age_bucket() {
+        let now = Utc::now();
+        let created: Vec<_> = [0, 8, 10, 400]
+            .into_iter()
+            .map(|days| now - Duration::days(days))
+            .collect();
+        let retention = RetentionConfig {
+            count: None,
+            age: Some("5d".to_owned()),
+        };
+
+        assert_eq!(retention_removals(&created, &retention, now).unwrap(), [1]);
     }
 }

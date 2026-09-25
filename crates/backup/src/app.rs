@@ -76,7 +76,11 @@ fn execute(cli: Cli) -> Result<ExitCode> {
             let report = runner.run_named(&job)?;
             match output::format() {
                 Format::Json => output::emit_result(&report)?,
-                Format::Text => println!("backup {job} completed or staged for retry"),
+                Format::Text if report.failed > 0 => println!(
+                    "backup {job} completed, {} destination(s) will be copied from another destination later",
+                    report.failed
+                ),
+                Format::Text => println!("backup {job} completed"),
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -116,7 +120,7 @@ fn execute(cli: Cli) -> Result<ExitCode> {
             }
             let config = Config::load(&paths.config)?;
             let operation_lock = AppLock::exclusive(&paths.operation_lock)?;
-            let result = operations::restore(config.job(&job)?, &archive, &to, yes, &paths);
+            let result = operations::restore(config.job(&job)?, &archive, &to, yes);
             drop(operation_lock);
             let restored = result?;
             if output::format() == Format::Json {
@@ -125,9 +129,22 @@ fn execute(cli: Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Command::Verify { job, archive } => {
+        Command::Export { job, archive, to } => {
             let config = Config::load(&paths.config)?;
             let operation_lock = AppLock::shared(&paths.operation_lock)?;
+            let result = operations::export(config.job(&job)?, &archive, &to);
+            drop(operation_lock);
+            let report = result?;
+            match output::format() {
+                Format::Json => output::emit_result(&report)?,
+                Format::Text => println!("exported {} to {}", report.archive, report.file),
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Verify { job, archive } => {
+            let config = Config::load(&paths.config)?;
+            // Verify repairs damage it finds, so it writes like a backup does.
+            let operation_lock = AppLock::exclusive(&paths.operation_lock)?;
             let result = operations::verify(&config, job.as_deref(), archive.as_deref());
             drop(operation_lock);
             let verified = result?;
@@ -315,7 +332,7 @@ fn print_health(report: &HealthReport) {
         }
     );
     if report.busy {
-        println!("a backup, delivery, or restore is running");
+        println!("a backup, delivery, restore, verify, or import is running");
     }
     for job in &report.jobs {
         if job.healthy {

@@ -1,718 +1,141 @@
-use std::fs::{self, File};
-use std::io::{self, ErrorKind, Write, copy};
-use std::path::{Path, PathBuf};
-use std::time::{Duration as StdDuration, SystemTime};
+//! Operations on one destination, local or over SSH. A remote destination
+//! runs the same store code inside its agent.
 
-use anyhow::{Context, Result};
-use chrono::{DateTime, Duration, NaiveDateTime, Utc};
-use tracing::{info, warn};
+use std::collections::HashSet;
+use std::io::Read;
 
-use crate::archive::{
-    Artifact, Sink, SinkId, create_private, read_checksum, verify_checksum, write_checksum,
-};
-use crate::config::{BackupJob, RetentionConfig};
+use anyhow::Result;
+
+use crate::archive::verify_stream;
+use crate::config::BackupJob;
 use crate::location::Location;
-use crate::retention::milestone_keepers;
+use crate::ssh::{self, RemoteSource, SshRepair};
+use crate::store::check::{StoreCheck, check_store, finish_repair, put_repaired};
+use crate::store::digest::Digest;
+use crate::store::gc::apply_retention;
+use crate::store::import::{ImportReport, import_legacy, legacy_names};
+use crate::store::recipe::{Recipe, RecipeInfo};
+use crate::store::{Store, StoreWriter};
+use crate::stream::{ChunkSource, RecipeStream, SourceRef};
 
-pub struct LocalSink {
-    destination: PathBuf,
-    partial: PathBuf,
-    target: PathBuf,
-    file: File,
-    job: BackupJob,
-}
-
-impl LocalSink {
-    pub fn open(destination: &Path, name: &str, job: &BackupJob) -> Result<Box<dyn Sink>> {
-        fs::create_dir_all(destination)
-            .with_context(|| format!("create destination {}", destination.display()))?;
-        sweep_stale_partials(destination);
-        let partial = destination.join(format!(".{name}.partial"));
-        remove_if_present(&partial)?;
-        let file = create_private(&partial)?;
-        Ok(Box::new(Self {
-            destination: destination.to_path_buf(),
-            partial,
-            target: destination.join(name),
-            file,
-            job: job.clone(),
-        }))
+pub fn list(destination: &Location, job: Option<&str>) -> Result<Vec<RecipeInfo>> {
+    match destination {
+        Location::Local(path) => Store::open(path)?.list_recipes(job),
+        Location::Ssh(remote) => ssh::list(remote, job),
     }
 }
 
-impl Sink for LocalSink {
-    fn id(&self) -> SinkId {
-        SinkId::Destination(Location::Local(self.destination.clone()))
-    }
-
-    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.file.write_all(bytes)
-    }
-
-    fn finish(self: Box<Self>, checksum: &str, _size: u64) -> Result<()> {
-        let result = (|| {
-            self.file.sync_all()?;
-            verify_checksum(&self.partial, checksum)?;
-            publish(&self.partial, &self.target, checksum)?;
-            Ok(())
-        })();
-        if result.is_err() {
-            remove_if_present(&self.partial)?;
-            return result;
-        }
-        info!(
-            job = self.job.name,
-            destination = %self.destination.display(),
-            archive = %self.target.display(),
-            "delivered archive"
-        );
-        prune_best_effort(&self.destination, &self.job);
-        Ok(())
-    }
-
-    fn abort(self: Box<Self>) -> Option<String> {
-        drop(self.file);
-        if let Err(error) = remove_if_present(&self.partial) {
-            warn!(%error, "could not remove partial destination archive");
-        }
-        None
+pub fn chunk_ids(destination: &Location) -> Result<HashSet<Digest>> {
+    match destination {
+        Location::Local(path) => Store::open(path)?.chunk_ids(),
+        Location::Ssh(remote) => ssh::chunk_ids(remote),
     }
 }
 
-fn publish(partial: &Path, target: &Path, checksum: &str) -> Result<()> {
-    fs::rename(partial, target)
-        .with_context(|| format!("publish destination archive {}", target.display()))?;
-    write_checksum(target, checksum)?;
-    let directory = target
-        .parent()
-        .context("destination archive has no parent directory")?;
-    File::open(directory)?.sync_all()?;
-    Ok(())
-}
-
-#[derive(Clone, Debug)]
-pub struct ArchiveInfo {
-    pub name: String,
-    pub path: PathBuf,
-    pub checksum: Option<String>,
-    pub size: u64,
-    pub created: DateTime<Utc>,
-}
-
-const ARCHIVE_SUFFIX: &str = ".tar.lz4";
-
-// Archive names are "<job>-<compact UTC seconds>-<uuid>.tar.lz4". Both trailing parts have a
-// fixed width, so the job name is whatever is left after removing them, even when it contains a
-// dash.
-const UUID_LEN: usize = 36;
-const TIMESTAMP_LEN: usize = 16;
-
-pub fn deliver_local(artifact: &Artifact, destination: &Path, job: &BackupJob) -> Result<()> {
-    fs::create_dir_all(destination)
-        .with_context(|| format!("create destination {}", destination.display()))?;
-    sweep_stale_partials(destination);
-    let target = destination.join(&artifact.name);
-    if target.exists() {
-        match verify_checksum(&target, &artifact.checksum) {
-            Ok(()) => {
-                ensure_checksum_file(&target, &artifact.checksum)?;
-                prune_best_effort(destination, job);
-                return Ok(());
-            }
-            Err(error) => {
-                warn!(
-                    path = %target.display(),
-                    %error,
-                    "replacing corrupt destination archive"
-                );
-            }
-        }
-    }
-
-    let partial = destination.join(format!(".{}.partial", artifact.name));
-    remove_if_present(&partial)?;
-    let mut source = File::open(&artifact.path)
-        .with_context(|| format!("open staged archive {}", artifact.path.display()))?;
-    let mut file = create_private(&partial)?;
-    copy(&mut source, &mut file).with_context(|| {
-        format!(
-            "copy archive {} to {}",
-            artifact.path.display(),
-            partial.display()
-        )
-    })?;
-    file.sync_all()?;
-    drop(file);
-    verify_checksum(&partial, &artifact.checksum)?;
-    publish(&partial, &target, &artifact.checksum)?;
-    info!(
-        job = job.name,
-        destination = %destination.display(),
-        archive = artifact.name,
-        "delivered archive"
-    );
-    prune_best_effort(destination, job);
-    Ok(())
-}
-
-fn prune_best_effort(destination: &Path, job: &BackupJob) {
-    if let Err(error) = apply_retention(destination, job) {
-        warn!(
-            job = job.name,
-            destination = %destination.display(),
-            %error,
-            "cleanup after delivery failed; the archive was still delivered"
-        );
+pub fn read_recipe(destination: &Location, name: &str) -> Result<Recipe> {
+    match destination {
+        Location::Local(path) => Store::open(path)?.read_recipe(name),
+        Location::Ssh(remote) => ssh::read_recipe(remote, name),
     }
 }
 
-pub fn list_local(destination: &Path, job: &str) -> Result<Vec<ArchiveInfo>> {
-    let mut archives = scan_archives(destination, job)?;
-    for archive in &mut archives {
-        archive.checksum = read_archive_checksum(&archive.path);
-    }
-    Ok(archives)
-}
-
-fn scan_archives(destination: &Path, job: &str) -> Result<Vec<ArchiveInfo>> {
-    if !destination.exists() {
-        return Ok(Vec::new());
-    }
-    let mut archives = Vec::new();
-    for entry in fs::read_dir(destination)
-        .with_context(|| format!("read destination {}", destination.display()))?
-    {
-        let entry = entry?;
-        let metadata = entry.metadata()?;
-        if !metadata.is_file() {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(parsed) = parse_archive_name(&name) else {
-            continue;
-        };
-        if parsed.job != job {
-            continue;
-        }
-        let created = parsed.created;
-        archives.push(ArchiveInfo {
-            name,
-            path: entry.path(),
-            checksum: None,
-            size: metadata.len(),
-            created,
-        });
-    }
-    archives.sort_by(|left, right| {
-        right
-            .created
-            .cmp(&left.created)
-            .then_with(|| right.name.cmp(&left.name))
-    });
-    Ok(archives)
-}
-
-pub(crate) struct ParsedArchive<'name> {
-    pub job: &'name str,
-    pub created: DateTime<Utc>,
-}
-
-pub(crate) fn parse_archive_name(name: &str) -> Option<ParsedArchive<'_>> {
-    let rest = name.strip_suffix(ARCHIVE_SUFFIX)?;
-    let rest = rest.get(..rest.len().checked_sub(UUID_LEN + 1)?)?;
-    let split = rest.len().checked_sub(TIMESTAMP_LEN + 1)?;
-    let job = rest.get(..split)?;
-    let stamp = rest.get(split..)?.strip_prefix('-')?;
-    let created = NaiveDateTime::parse_from_str(stamp, "%Y%m%dT%H%M%SZ")
-        .ok()?
-        .and_utc();
-    Some(ParsedArchive { job, created })
-}
-
-fn read_archive_checksum(archive: &Path) -> Option<String> {
-    let path = checksum_path(archive);
-    if !path.exists() {
-        return None;
-    }
-    match read_checksum(&path) {
-        Ok(checksum) => Some(checksum),
-        Err(error) => {
-            warn!(path = %path.display(), %error, "could not read checksum file; treating archive as unchecked");
-            None
+/// A chunk source for a destination. A remote one streams `order` over one
+/// connection when the chunks are then read in that order.
+pub fn open_source(destination: &Location, order: &[Digest]) -> Result<Box<dyn ChunkSource>> {
+    match destination {
+        Location::Local(path) => Ok(Box::new(Store::open(path)?)),
+        Location::Ssh(remote) => {
+            let mut source = RemoteSource::new(remote);
+            source.prefetch(order)?;
+            Ok(Box::new(source))
         }
     }
 }
 
-pub fn apply_retention(destination: &Path, job: &BackupJob) -> Result<()> {
-    let Some(retention) = &job.retention else {
-        return Ok(());
-    };
-    let archives = scan_archives(destination, &job.name)?;
-    let removals = retention_removals(&archives, retention, Utc::now())?;
-    for archive in removals {
-        let checksum_file = checksum_path(&archive.path);
-        fs::remove_file(&archive.path)
-            .with_context(|| format!("remove retained archive {}", archive.path.display()))?;
-        remove_if_present(&checksum_file)?;
-        info!(
-            job = job.name,
-            archive = archive.name,
-            destination = %destination.display(),
-            "removed archive due to retention"
-        );
+pub fn check(destination: &Location) -> Result<StoreCheck> {
+    match destination {
+        Location::Local(path) => check_store(&mut Store::open(path)?),
+        Location::Ssh(remote) => ssh::check(remote),
     }
-    Ok(())
 }
 
-// Milestone keepers, one archive per age bucket, are exempt from the
-// configured rule, so the rule only ever counts and removes the rest.
-fn retention_removals<'archive>(
-    archives: &'archive [ArchiveInfo],
-    retention: &RetentionConfig,
-    now: DateTime<Utc>,
-) -> Result<Vec<&'archive ArchiveInfo>> {
-    let created: Vec<_> = archives.iter().map(|archive| archive.created).collect();
-    let keepers = milestone_keepers(&created, now);
-    let candidates = archives
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| !keepers.contains(index))
-        .map(|(_, archive)| archive);
-    if let Some(count) = retention.count {
-        return Ok(candidates.skip(count).collect());
-    }
-    let Some(age) = retention.age_duration()? else {
-        return Ok(Vec::new());
-    };
-    let age = Duration::from_std(age).context("retention age is too large")?;
-    let cutoff = now - age;
-    Ok(candidates
-        .filter(|archive| archive.created < cutoff)
-        .collect())
+/// Takes good copies of chunks a check found bad, then retires the damaged
+/// packs and writes back lost recipes.
+pub enum Repair {
+    Local {
+        writer: Box<StoreWriter>,
+        damaged: Vec<Digest>,
+        recipes: Vec<Recipe>,
+    },
+    Remote(SshRepair),
 }
 
-fn ensure_checksum_file(archive: &Path, checksum: &str) -> Result<()> {
-    let checksum_file = checksum_path(archive);
-    if checksum_file.exists() {
-        let existing = read_checksum(&checksum_file)?;
-        if existing != checksum {
-            warn!(
-                path = %checksum_file.display(),
-                "repairing checksum file that disagrees with verified archive"
-            );
-            write_checksum(archive, checksum)?;
-        }
-        return Ok(());
-    }
-    write_checksum(archive, checksum)?;
-    Ok(())
-}
-
-pub fn checksum_path(archive: &Path) -> PathBuf {
-    PathBuf::from(format!("{}.blake3", archive.display()))
-}
-
-pub(crate) fn belongs_to_job(name: &str, job: &str) -> bool {
-    parse_archive_name(name).is_some_and(|parsed| parsed.job == job)
-}
-
-const STALE_PARTIAL_AGE: StdDuration = StdDuration::from_secs(24 * 60 * 60);
-
-// A crashed run or a killed SSH connection leaves partial files behind, and a
-// retried archive gets a new name, so nothing else ever removes them. An active
-// partial keeps a fresh modification time while bytes land, so the age guard
-// never removes a transfer that is still running.
-pub(crate) fn sweep_stale_partials(directory: &Path) {
-    let entries = match fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(error) => {
-            warn!(directory = %directory.display(), %error, "could not scan for stale partial files");
-            return;
-        }
-    };
-    let now = SystemTime::now();
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                warn!(directory = %directory.display(), %error, "could not read a directory entry");
-                continue;
-            }
-        };
-        if !is_temporary_name(&entry.file_name().to_string_lossy()) {
-            continue;
-        }
-        let path = entry.path();
-        let stale = entry
-            .metadata()
-            .and_then(|metadata| Ok((metadata.is_file(), metadata.modified()?)))
-            .map(|(is_file, modified)| {
-                is_file && now.duration_since(modified).unwrap_or_default() >= STALE_PARTIAL_AGE
-            });
-        match stale {
-            Ok(false) => {}
-            Ok(true) => match fs::remove_file(&path) {
-                Ok(()) => info!(path = %path.display(), "removed stale partial file"),
-                Err(error) => {
-                    warn!(path = %path.display(), %error, "could not remove stale partial file");
-                }
+impl Repair {
+    pub fn open(destination: &Location, damaged: &[Digest], recipes: &[Recipe]) -> Result<Self> {
+        Ok(match destination {
+            Location::Local(path) => Self::Local {
+                writer: Box::new(Store::open(path)?.into_writer()),
+                damaged: damaged.to_vec(),
+                recipes: recipes.to_vec(),
             },
-            Err(error) => {
-                warn!(path = %path.display(), %error, "could not read the age of a partial file");
-            }
+            Location::Ssh(remote) => Self::Remote(SshRepair::open(remote, damaged, recipes)?),
+        })
+    }
+
+    pub fn put(&mut self, id: &Digest, bytes: &[u8]) -> Result<()> {
+        match self {
+            Self::Local { writer, .. } => put_repaired(writer, id, bytes),
+            Self::Remote(repair) => repair.put(id, bytes),
+        }
+    }
+
+    pub fn finish(self) -> Result<()> {
+        match self {
+            Self::Local {
+                writer,
+                damaged,
+                recipes,
+            } => finish_repair((*writer).finish()?, &damaged, &recipes).map(drop),
+            Self::Remote(repair) => repair.finish(),
         }
     }
 }
 
-fn is_temporary_name(name: &str) -> bool {
-    (name.starts_with('.') && name.ends_with(".partial"))
-        || name.starts_with(".restore-")
-        || name.starts_with(".backup-write-test-")
-}
-
-fn remove_if_present(path: &Path) -> Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-        Err(error) => {
-            warn!(path = %path.display(), %error, "failed to remove partial file");
-            Err(error).with_context(|| format!("remove {}", path.display()))
+/// Rebuilds one backup from this destination alone and reads it as a tar.
+pub fn verify_archive(destination: &Location, name: &str) -> Result<()> {
+    match destination {
+        Location::Local(path) => {
+            let mut store = Store::open(path)?;
+            let recipe = store.read_recipe(name)?;
+            verify_local(&mut store, &recipe)
         }
+        Location::Ssh(remote) => ssh::verify_archive(remote, name),
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::cmp::Reverse;
-    use std::fs;
-    use std::path::PathBuf;
-    use std::time::{Duration as StdDuration, SystemTime};
+pub fn verify_local(store: &mut Store, recipe: &Recipe) -> Result<()> {
+    let mut sources: [SourceRef<'_>; 1] = [store];
+    let mut stream = RecipeStream::new(&mut sources, recipe);
+    verify_stream(&mut stream as &mut dyn Read)
+}
 
-    use chrono::{DateTime, Duration, Utc};
-    use tempfile::tempdir;
-
-    use super::{
-        ArchiveInfo, apply_retention, checksum_path, deliver_local, list_local, parse_archive_name,
-        retention_removals, sweep_stale_partials,
-    };
-    use crate::archive::{Artifact, checksum_file, read_checksum};
-    use crate::config::{BackupJob, RetentionConfig};
-    use crate::location::Location;
-
-    fn archive_name(hour: u32, tag: char) -> String {
-        let group = |count: usize| std::iter::repeat_n(tag, count).collect::<String>();
-        let uuid = format!(
-            "{}-{}-{}-{}-{}",
-            group(8),
-            group(4),
-            group(4),
-            group(4),
-            group(12)
-        );
-        format!("job-20260717T{hour:02}0000Z-{uuid}.tar.lz4")
+pub fn prune(destination: &Location, job: &BackupJob) -> Result<()> {
+    match destination {
+        Location::Local(path) => apply_retention(Store::open(path)?, job).map(drop),
+        Location::Ssh(remote) => ssh::prune(remote, job),
     }
+}
 
-    #[test]
-    fn only_stale_temporary_files_are_swept() {
-        let temporary = tempdir().unwrap();
-        let directory = temporary.path();
-        let stale_partial = directory.join(".doc.tar.lz4.partial");
-        let stale_restore = directory.join(".restore-x-doc.tar.lz4");
-        let stale_probe = directory.join(".backup-write-test-x");
-        let fresh_partial = directory.join(".new.tar.lz4.partial");
-        let archive = directory.join(archive_name(1, 'a'));
-        for path in [
-            &stale_partial,
-            &stale_restore,
-            &stale_probe,
-            &fresh_partial,
-            &archive,
-        ] {
-            fs::write(path, "x").unwrap();
-        }
-        let old = SystemTime::now() - StdDuration::from_secs(2 * 24 * 60 * 60);
-        for path in [&stale_partial, &stale_restore, &stale_probe, &archive] {
-            fs::File::open(path).unwrap().set_modified(old).unwrap();
-        }
-
-        sweep_stale_partials(directory);
-
-        assert!(!stale_partial.exists());
-        assert!(!stale_restore.exists());
-        assert!(!stale_probe.exists());
-        assert!(fresh_partial.exists(), "a fresh partial was removed");
-        assert!(archive.exists(), "a real archive was removed");
+pub fn legacy(destination: &Location) -> Result<Vec<String>> {
+    match destination {
+        Location::Local(path) => legacy_names(path),
+        Location::Ssh(remote) => ssh::legacy(remote),
     }
+}
 
-    #[test]
-    fn missing_checksum_on_a_sibling_does_not_break_delivery_cleanup_or_list() {
-        let temporary = tempdir().unwrap();
-        let staging = temporary.path().join("staging");
-        let destination = temporary.path().join("destination");
-        fs::create_dir_all(&staging).unwrap();
-        fs::create_dir_all(&destination).unwrap();
-
-        let orphan = archive_name(1, '0');
-        fs::write(destination.join(&orphan), "old archive").unwrap();
-
-        let fresh = archive_name(2, '1');
-        let archive_path = staging.join(&fresh);
-        fs::write(&archive_path, "new archive").unwrap();
-        let checksum = checksum_file(&archive_path).unwrap();
-        let artifact = Artifact {
-            name: fresh.clone(),
-            path: archive_path,
-            checksum_path: PathBuf::new(),
-            checksum,
-            size: 11,
-            created_at: Utc::now(),
-        };
-        let job = BackupJob {
-            name: "job".to_owned(),
-            source: Location::Local(PathBuf::from("/source")),
-            destinations: vec![Location::Local(destination.clone())],
-            cron: "0 0 * * *".to_owned(),
-            retention: Some(RetentionConfig {
-                count: Some(5),
-                age: None,
-            }),
-            pre: None,
-            exclude: Vec::new(),
-        };
-
-        deliver_local(&artifact, &destination, &job).unwrap();
-        assert!(destination.join(&fresh).exists());
-
-        let archives = list_local(&destination, "job").unwrap();
-        assert_eq!(archives.len(), 2);
-        assert!(
-            archives
-                .iter()
-                .find(|archive| archive.name == orphan)
-                .unwrap()
-                .checksum
-                .is_none()
-        );
-        assert!(
-            archives
-                .iter()
-                .find(|archive| archive.name == fresh)
-                .unwrap()
-                .checksum
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn newest_is_chosen_by_name_timestamp_not_file_time() {
-        let temporary = tempdir().unwrap();
-        let newer_name = archive_name(5, 'a');
-        let older_name = archive_name(1, 'b');
-        fs::write(temporary.path().join(&newer_name), "a").unwrap();
-        fs::write(temporary.path().join(&older_name), "b").unwrap();
-
-        // Give the older-named archive the newest file time, the exact case retention used to
-        // misread. Ordering must still follow the timestamp in the name, not the file time.
-        fs::File::open(temporary.path().join(&older_name))
-            .unwrap()
-            .set_modified(SystemTime::now())
-            .unwrap();
-        fs::File::open(temporary.path().join(&newer_name))
-            .unwrap()
-            .set_modified(SystemTime::now() - StdDuration::from_secs(3600))
-            .unwrap();
-
-        let archives = list_local(temporary.path(), "job").unwrap();
-        assert_eq!(archives[0].name, newer_name);
-        assert_eq!(archives[1].name, older_name);
-    }
-
-    #[test]
-    fn retention_leaves_a_job_whose_name_starts_with_this_one_alone() {
-        let temporary = tempdir().unwrap();
-        let shared = temporary.path();
-        let mine = "docs-20260717T010000Z-00000000-0000-0000-0000-000000000000.tar.lz4";
-        let theirs = "docs-archive-20260717T020000Z-11111111-1111-1111-1111-111111111111.tar.lz4";
-        fs::write(shared.join(mine), "mine").unwrap();
-        fs::write(shared.join(theirs), "theirs").unwrap();
-        let job = BackupJob {
-            name: "docs".to_owned(),
-            source: Location::Local(PathBuf::from("/source")),
-            destinations: vec![Location::Local(shared.to_path_buf())],
-            cron: "0 0 * * *".to_owned(),
-            retention: Some(RetentionConfig {
-                count: Some(1),
-                age: None,
-            }),
-            pre: None,
-            exclude: Vec::new(),
-        };
-
-        assert_eq!(list_local(shared, "docs").unwrap().len(), 1);
-        apply_retention(shared, &job).unwrap();
-
-        assert!(shared.join(mine).exists());
-        assert!(shared.join(theirs).exists());
-    }
-
-    #[test]
-    fn a_job_name_containing_dashes_still_parses() {
-        let name = "my-nice-job-20260717T020000Z-11111111-1111-1111-1111-111111111111.tar.lz4";
-        let parsed = parse_archive_name(name).unwrap();
-        assert_eq!(parsed.job, "my-nice-job");
-        assert_eq!(parsed.created.to_rfc3339(), "2026-07-17T02:00:00+00:00");
-        assert!(parse_archive_name("not-an-archive.txt").is_none());
-    }
-
-    #[test]
-    fn count_retention_keeps_newest_archives() {
-        let directory = tempdir().unwrap();
-        let archives: Vec<_> = (0..4)
-            .map(|offset| ArchiveInfo {
-                name: format!("job-{offset}.tar.lz4"),
-                path: directory.path().join(format!("job-{offset}.tar.lz4")),
-                checksum: None,
-                size: 1,
-                created: Utc::now() - Duration::minutes(offset),
-            })
-            .collect();
-        let retention = RetentionConfig {
-            count: Some(2),
-            age: None,
-        };
-        let removals = retention_removals(&archives, &retention, Utc::now()).unwrap();
-        assert_eq!(removals.len(), 2);
-        assert_eq!(removals[0].name, "job-2.tar.lz4");
-    }
-
-    fn aged_archive(days: i64, now: DateTime<Utc>) -> ArchiveInfo {
-        ArchiveInfo {
-            name: format!("job-{days}.tar.lz4"),
-            path: PathBuf::from(format!("job-{days}.tar.lz4")),
-            checksum: None,
-            size: 1,
-            created: now - Duration::days(days),
-        }
-    }
-
-    #[test]
-    fn count_retention_spares_one_keeper_per_age_bucket() {
-        let now = Utc::now();
-        let mut archives: Vec<_> = [0, 1, 2, 8, 10, 20, 40, 100, 400, 800]
-            .into_iter()
-            .map(|days| aged_archive(days, now))
-            .collect();
-        archives.sort_by_key(|archive| Reverse(archive.created));
-        let retention = RetentionConfig {
-            count: Some(2),
-            age: None,
-        };
-
-        let removals = retention_removals(&archives, &retention, now).unwrap();
-
-        // 0 and 1 survive as the newest two. 10, 20, 40, 100, 400, and 800
-        // are the oldest archives of their buckets. Only 2 and 8 go.
-        let mut removed: Vec<_> = removals
-            .iter()
-            .map(|archive| archive.name.clone())
-            .collect();
-        removed.sort();
-        assert_eq!(removed, ["job-2.tar.lz4", "job-8.tar.lz4"]);
-    }
-
-    #[test]
-    fn age_retention_spares_one_keeper_per_age_bucket() {
-        let now = Utc::now();
-        let mut archives: Vec<_> = [0, 8, 10, 400]
-            .into_iter()
-            .map(|days| aged_archive(days, now))
-            .collect();
-        archives.sort_by_key(|archive| Reverse(archive.created));
-        let retention = RetentionConfig {
-            count: None,
-            age: Some("5d".to_owned()),
-        };
-
-        let removals = retention_removals(&archives, &retention, now).unwrap();
-
-        assert_eq!(removals.len(), 1);
-        assert_eq!(removals[0].name, "job-8.tar.lz4");
-    }
-
-    #[test]
-    fn delivered_archives_are_readable_only_by_their_owner() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temporary = tempdir().unwrap();
-        let staging = temporary.path().join("staging");
-        let destination = temporary.path().join("destination");
-        fs::create_dir_all(&staging).unwrap();
-        fs::create_dir_all(&destination).unwrap();
-        let name = archive_name(3, 'c');
-        let archive_path = staging.join(&name);
-        fs::write(&archive_path, "private data").unwrap();
-        let checksum = checksum_file(&archive_path).unwrap();
-        let artifact = Artifact {
-            name: name.clone(),
-            path: archive_path,
-            checksum_path: PathBuf::new(),
-            checksum,
-            size: 12,
-            created_at: Utc::now(),
-        };
-        let job = BackupJob {
-            name: "job".to_owned(),
-            source: Location::Local(PathBuf::from("/source")),
-            destinations: vec![Location::Local(destination.clone())],
-            cron: "0 0 * * *".to_owned(),
-            retention: None,
-            pre: None,
-            exclude: Vec::new(),
-        };
-
-        deliver_local(&artifact, &destination, &job).unwrap();
-
-        let mode = fs::metadata(destination.join(&name))
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o600);
-    }
-
-    #[test]
-    fn delivery_replaces_a_corrupt_copy_and_repairs_its_checksum_file() {
-        let temporary = tempdir().unwrap();
-        let staging = temporary.path().join("staging");
-        let destination = temporary.path().join("destination");
-        fs::create_dir_all(&staging).unwrap();
-        fs::create_dir_all(&destination).unwrap();
-        let archive_path = staging.join("job-archive.tar.lz4");
-        fs::write(&archive_path, "healthy archive").unwrap();
-        let checksum = checksum_file(&archive_path).unwrap();
-        let artifact = Artifact {
-            name: "job-archive.tar.lz4".to_owned(),
-            path: archive_path,
-            checksum_path: PathBuf::new(),
-            checksum: checksum.clone(),
-            size: 15,
-            created_at: Utc::now(),
-        };
-        let target = destination.join(&artifact.name);
-        fs::write(&target, "corrupt").unwrap();
-        fs::write(checksum_path(&target), "wrong  job-archive.tar.lz4\n").unwrap();
-        let job = BackupJob {
-            name: "job".to_owned(),
-            source: Location::Local(PathBuf::from("/source")),
-            destinations: vec![Location::Local(destination.clone())],
-            cron: "0 0 * * *".to_owned(),
-            retention: None,
-            pre: None,
-            exclude: Vec::new(),
-        };
-
-        deliver_local(&artifact, &destination, &job).unwrap();
-
-        assert_eq!(fs::read_to_string(&target).unwrap(), "healthy archive");
-        assert_eq!(read_checksum(&checksum_path(&target)).unwrap(), checksum);
+pub fn import(destination: &Location, name: &str) -> Result<ImportReport> {
+    match destination {
+        Location::Local(path) => import_legacy(Store::open(path)?, name).map(|(_, report)| report),
+        Location::Ssh(remote) => ssh::import(remote, name),
     }
 }

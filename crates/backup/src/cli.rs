@@ -44,6 +44,15 @@ pub enum Command {
         #[arg(long)]
         yes: bool,
     },
+    Export {
+        job: String,
+
+        #[arg(default_value = "latest")]
+        archive: String,
+
+        #[arg(long)]
+        to: PathBuf,
+    },
     Verify {
         job: Option<String>,
 

@@ -5,19 +5,18 @@ use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use lz4_flex::frame::FrameEncoder;
 use tar::{Builder, EntryType, Header, HeaderMode};
 
 use super::catalog::{Entry, FileKind, Visit};
 
 pub struct ArchiveWriter<W: Write> {
-    builder: Builder<FrameEncoder<W>>,
+    builder: Builder<W>,
     hard_links: HashMap<(u64, u64), PathBuf>,
 }
 
 impl<W: Write> ArchiveWriter<W> {
     pub fn new(writer: W) -> Self {
-        let mut builder = Builder::new(FrameEncoder::new(writer));
+        let mut builder = Builder::new(writer);
         builder.mode(HeaderMode::Complete);
         builder.follow_symlinks(false);
         Self {
@@ -94,8 +93,7 @@ impl<W: Write> ArchiveWriter<W> {
 
     pub fn finish(mut self) -> Result<W> {
         self.builder.finish()?;
-        let encoder = self.builder.into_inner().context("finish TAR archive")?;
-        encoder.finish().context("finish LZ4 frame")
+        self.builder.into_inner().context("finish TAR archive")
     }
 }
 

@@ -40,7 +40,6 @@ struct RunData {
     size: u64,
     delivered: usize,
     failed: usize,
-    staged: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -173,7 +172,6 @@ fn json_run_streams_events_and_ends_with_a_result_envelope() {
     assert!(envelope.data.size > 0);
     assert_eq!(envelope.data.delivered, 1);
     assert_eq!(envelope.data.failed, 0);
-    assert!(!envelope.data.staged);
 }
 
 #[test]
@@ -340,20 +338,25 @@ fn json_is_rejected_for_unsupported_commands() {
     );
 }
 
+// A backup is a recipe in the destination's recipes folder, named after the
+// archive it rebuilds.
 fn archives(destination: &Path) -> Vec<String> {
-    let Ok(entries) = fs::read_dir(destination) else {
+    let Ok(entries) = fs::read_dir(destination.join("recipes")) else {
         return Vec::new();
     };
-    entries
-        .map(|entry| {
-            entry
+    let mut names: Vec<String> = entries
+        .filter_map(|entry| {
+            let name = entry
                 .expect("read destination entry")
                 .file_name()
                 .to_string_lossy()
-                .into_owned()
+                .into_owned();
+            name.strip_suffix(".recipe").map(str::to_owned)
         })
         .filter(|name| name.ends_with(".tar.lz4"))
-        .collect()
+        .collect();
+    names.sort();
+    names
 }
 
 #[test]
@@ -362,7 +365,7 @@ fn text_output_is_unchanged_without_the_flag() {
     sandbox.write_config("0 2 * * *");
 
     let run = sandbox.run(&["run", "documents"]);
-    assert!(String::from_utf8_lossy(&run.stdout).contains("completed or staged for retry"));
+    assert!(String::from_utf8_lossy(&run.stdout).contains("backup documents completed"));
     assert_eq!(archives(&sandbox.path("destination")).len(), 1);
 
     let status = sandbox.run(&["status"]);

@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -12,12 +10,9 @@ use crate::location::Location;
 pub struct RunRecord {
     pub job: BackupJob,
     pub archive_name: String,
-    pub archive_path: PathBuf,
-    pub checksum_path: PathBuf,
     pub checksum: String,
     pub size: u64,
     pub created_at: i64,
-    pub staged: bool,
     pub completed_at: Option<i64>,
 }
 
@@ -61,17 +56,11 @@ pub struct PendingDelivery {
 #[derive(Clone, Debug)]
 pub struct ForgottenRun {
     pub archive_name: String,
-    pub archive: PathBuf,
-    pub checksum: PathBuf,
-    pub staged: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct CompletedRun {
     pub run_id: Uuid,
-    pub archive: PathBuf,
-    pub checksum: PathBuf,
-    pub staged: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -96,4 +85,18 @@ pub struct BackupRetry {
     pub slot: DateTime<Utc>,
     pub attempts: u32,
     pub next_retry: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ImportFailure {
+    pub destination: String,
+    pub archive: String,
+    pub error: String,
+    pub at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ImportFailureRecord {
+    pub error: String,
+    pub at: i64,
 }

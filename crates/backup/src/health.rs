@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -5,10 +6,12 @@ use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 
+use crate::archive::parse_archive_name;
 use crate::config::Config;
 use crate::daemon::unhandled_slot;
 use crate::lock::is_locked;
-use crate::state::State;
+use crate::maintenance::VERIFY_EVERY_DAYS;
+use crate::state::{HistoryLine, State};
 
 const GRACE_SECONDS: i64 = 3600;
 
@@ -17,6 +20,10 @@ const GRACE_SECONDS: i64 = 3600;
 // The queue is serial, so other jobs are merely waiting behind it. The longer
 // limit still catches an operation that is truly wedged.
 const BUSY_GRACE_SECONDS: i64 = 24 * 3600;
+
+// A destination is verified every week. One day more before it counts as a
+// problem leaves room for a verify that waited behind backups.
+const VERIFY_OVERDUE_DAYS: i64 = VERIFY_EVERY_DAYS + 1;
 
 #[derive(Debug, Serialize)]
 pub struct HealthReport {
@@ -43,6 +50,9 @@ pub fn check(
     let daemon_running = is_locked(daemon_lock)?;
     let busy = is_locked(operation_lock)?;
     let pending = state.status()?;
+    let history = state.history()?;
+    let verify_problems = state.verify_problems()?;
+    let import_failures = state.import_failures()?;
     let grace = Duration::seconds(if busy {
         BUSY_GRACE_SECONDS
     } else {
@@ -65,6 +75,34 @@ pub fn check(
                 problems.push(format!(
                     "{} destination(s) still pending for archive {}",
                     line.pending_destinations, line.archive
+                ));
+            }
+        }
+        for destination in &job.destinations {
+            if let Some(last) = state.last_verified(destination)?
+                && now - last > Duration::days(VERIFY_OVERDUE_DAYS)
+            {
+                problems.push(format!(
+                    "destination {destination} was last verified {}",
+                    last.to_rfc3339()
+                ));
+            }
+            let key = destination.to_string();
+            for (_, problem) in verify_problems
+                .iter()
+                .filter(|(location, _)| *location == key)
+            {
+                problems.push(format!("verify of {destination}: {problem}"));
+            }
+        }
+        if let Some(problem) = shrunk(&history, &job.name) {
+            problems.push(problem);
+        }
+        for failure in &import_failures {
+            if parse_archive_name(&failure.archive).is_some_and(|parsed| parsed.job == job.name) {
+                problems.push(format!(
+                    "old archive {} at {} could not be imported: {}",
+                    failure.archive, failure.destination, failure.error
                 ));
             }
         }
@@ -100,6 +138,22 @@ pub fn check(
     })
 }
 
+// A backup much smaller than the one before usually means data went missing
+// from the source. The check clears by itself after the next normal backup.
+fn shrunk(history: &[HistoryLine], job: &str) -> Option<String> {
+    let mut runs: Vec<&HistoryLine> = history.iter().filter(|line| line.job == job).collect();
+    runs.sort_by_key(|line| Reverse(line.created_at));
+    let [newest, previous, ..] = runs.as_slice() else {
+        return None;
+    };
+    (newest.size * 2 < previous.size).then(|| {
+        format!(
+            "newest archive {} is {} bytes, less than half of the {} bytes before it",
+            newest.archive, newest.size, previous.size
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -107,11 +161,11 @@ mod tests {
     use chrono::{Duration, TimeZone, Utc};
     use tempfile::tempdir;
 
-    use super::check;
+    use super::{check, shrunk};
     use crate::archive::Artifact;
     use crate::config::{BackupJob, Config};
     use crate::location::Location;
-    use crate::state::State;
+    use crate::state::{HistoryLine, State};
 
     fn config() -> Config {
         Config {
@@ -201,16 +255,66 @@ mod tests {
         let job = config().jobs[0].clone();
         let artifact = Artifact {
             name: "documents-archive.tar".to_owned(),
-            path: temporary.path().join("archive.tar"),
-            checksum_path: temporary.path().join("archive.tar.blake3"),
             checksum: "abc".to_owned(),
             size: 12,
             created_at: now - Duration::hours(2),
         };
-        state.register_run(&artifact, &job, true, &[]).unwrap();
+        state.register_run(&artifact, &job, &[]).unwrap();
 
         let report = check(&config(), &state, &lock, &operation, now).unwrap();
         assert!(!report.jobs[0].healthy);
         assert!(report.jobs[0].problems[0].contains("still pending"));
+    }
+
+    fn line(archive: &str, size: u64, hours_ago: i64) -> HistoryLine {
+        let now = Utc::now();
+        HistoryLine {
+            job: "documents".to_owned(),
+            archive: archive.to_owned(),
+            size,
+            created_at: now - Duration::hours(hours_ago),
+            completed_at: now - Duration::hours(hours_ago),
+        }
+    }
+
+    #[test]
+    fn a_backup_less_than_half_the_one_before_is_a_problem() {
+        let history = [line("new", 40, 1), line("old", 100, 25)];
+        assert!(shrunk(&history, "documents").is_some());
+        let history = [line("new", 60, 1), line("old", 100, 25)];
+        assert!(shrunk(&history, "documents").is_none());
+        assert!(shrunk(&history[..1], "documents").is_none());
+    }
+
+    #[test]
+    fn a_destination_not_verified_for_over_eight_days_is_a_problem() {
+        let temporary = tempdir().unwrap();
+        let state = State::open(&temporary.path().join("state.redb")).unwrap();
+        let lock = temporary.path().join("daemon.lock");
+        let operation = temporary.path().join("operation.lock");
+        let now = Utc.with_ymd_and_hms(2026, 8, 28, 12, 0, 0).unwrap();
+        state
+            .set_last_scheduled(
+                "documents",
+                Utc.with_ymd_and_hms(2026, 8, 28, 2, 0, 0).unwrap(),
+            )
+            .unwrap();
+        let destination = config().jobs[0].destinations[0].clone();
+
+        state
+            .set_last_verified(&destination, now - Duration::days(7))
+            .unwrap();
+        assert!(
+            check(&config(), &state, &lock, &operation, now)
+                .unwrap()
+                .jobs[0]
+                .healthy
+        );
+
+        state
+            .set_last_verified(&destination, now - Duration::days(9))
+            .unwrap();
+        let report = check(&config(), &state, &lock, &operation, now).unwrap();
+        assert!(report.jobs[0].problems[0].contains("last verified"));
     }
 }
