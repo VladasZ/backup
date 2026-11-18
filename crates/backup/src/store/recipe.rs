@@ -29,6 +29,13 @@ pub struct RecipeInfo {
     pub created: DateTime<Utc>,
     pub size: u64,
     pub checksum: String,
+    /// The data this backup added to the store compared with the backup of
+    /// its job before it, and those bytes as stored after compression. Only
+    /// `Store::list_sized` fills them.
+    #[serde(default)]
+    pub new_size: Option<u64>,
+    #[serde(default)]
+    pub new_stored: Option<u64>,
 }
 
 impl Recipe {
@@ -39,6 +46,8 @@ impl Recipe {
             created: self.created,
             size: self.size,
             checksum: self.checksum.clone(),
+            new_size: None,
+            new_stored: None,
         }
     }
 }

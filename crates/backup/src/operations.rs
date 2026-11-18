@@ -58,6 +58,10 @@ pub struct ArchiveEntry {
     pub destination: String,
     pub name: String,
     pub size: u64,
+    /// The data this backup added to this destination compared with the
+    /// backup before it, raw and as stored after compression.
+    pub new_size: Option<u64>,
+    pub new_stored: Option<u64>,
     pub created: DateTime<Utc>,
     // Every backup now carries its checksum inside its sealed recipe. The
     // field stays for readers of the JSON listing that still expect it.
@@ -88,6 +92,8 @@ pub fn list(config: &Config, job_name: Option<&str>) -> Result<Vec<ArchiveEntry>
             destination: located.destination.to_string(),
             name: located.archive.name,
             size: located.archive.size,
+            new_size: located.archive.new_size,
+            new_stored: located.archive.new_stored,
             created: located.archive.created,
             checksum_missing: false,
         }));
@@ -300,6 +306,37 @@ pub fn verify(
         bail!("no matching archives found");
     }
     Ok(verified)
+}
+
+/// The space one destination of a job takes, or why it could not be read.
+#[derive(Debug, Serialize)]
+pub struct DestinationUsage {
+    pub destination: String,
+    pub bytes: Option<u64>,
+    pub error: Option<String>,
+}
+
+/// The space each destination of the job takes on its disk. A destination
+/// that cannot be read is reported with its error, the others still are.
+pub fn usage(job: &BackupJob) -> Vec<DestinationUsage> {
+    job.destinations
+        .iter()
+        .map(|destination| match destination::usage(destination) {
+            Ok(bytes) => DestinationUsage {
+                destination: destination.to_string(),
+                bytes: Some(bytes),
+                error: None,
+            },
+            Err(error) => {
+                warn!(%destination, error = %format!("{error:#}"), "could not read the size of a destination");
+                DestinationUsage {
+                    destination: destination.to_string(),
+                    bytes: None,
+                    error: Some(format!("{error:#}")),
+                }
+            }
+        })
+        .collect()
 }
 
 pub fn prune(config: &Config, job_name: Option<&str>) -> Result<Vec<PruneEntry>> {

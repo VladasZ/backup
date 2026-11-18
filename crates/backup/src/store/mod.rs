@@ -164,12 +164,58 @@ impl Store {
             }
             infos.push(self.read_recipe(&name)?.info());
         }
-        infos.sort_by(|left, right| {
-            right
-                .created
-                .cmp(&left.created)
-                .then_with(|| right.name.cmp(&left.name))
+        newest_first(&mut infos);
+        Ok(infos)
+    }
+
+    /// Like `list_recipes`, with the data each backup added to this store
+    /// compared with the backup of its job before it, raw and as stored. A
+    /// chunk the index lacks leaves the stored size unknown.
+    pub fn list_sized(&mut self, job: Option<&str>) -> Result<Vec<RecipeInfo>> {
+        let mut recipes = Vec::new();
+        for name in self.recipe_names()? {
+            let belongs = parse_archive_name(&name)
+                .is_some_and(|parsed| job.is_none_or(|job| parsed.job == job));
+            if belongs {
+                recipes.push(self.read_recipe(&name)?);
+            }
+        }
+        recipes.sort_by(|left, right| {
+            left.job
+                .cmp(&right.job)
+                .then_with(|| left.created.cmp(&right.created))
+                .then_with(|| left.name.cmp(&right.name))
         });
+        let index = self.index()?;
+        let mut infos = Vec::with_capacity(recipes.len());
+        let mut before: Option<(&str, HashSet<Digest>)> = None;
+        for recipe in &recipes {
+            let earlier = before
+                .as_ref()
+                .filter(|(job, _)| *job == recipe.job)
+                .map(|(_, ids)| ids);
+            let mut counted = HashSet::new();
+            let mut new_size = 0u64;
+            let mut new_stored = Some(0u64);
+            for chunk in &recipe.chunks {
+                if earlier.is_some_and(|ids| ids.contains(&chunk.id)) || !counted.insert(chunk.id) {
+                    continue;
+                }
+                new_size += u64::from(chunk.size);
+                new_stored = new_stored
+                    .zip(index.stored_size(&chunk.id))
+                    .map(|(sum, stored)| sum + u64::from(stored));
+            }
+            let mut info = recipe.info();
+            info.new_size = Some(new_size);
+            info.new_stored = new_stored;
+            infos.push(info);
+            before = Some((
+                recipe.job.as_str(),
+                recipe.chunks.iter().map(|chunk| chunk.id).collect(),
+            ));
+        }
+        newest_first(&mut infos);
         Ok(infos)
     }
 
@@ -285,4 +331,13 @@ impl StoreWriter {
         }
         Ok(self.store)
     }
+}
+
+fn newest_first(infos: &mut [RecipeInfo]) {
+    infos.sort_by(|left, right| {
+        right
+            .created
+            .cmp(&left.created)
+            .then_with(|| right.name.cmp(&left.name))
+    });
 }

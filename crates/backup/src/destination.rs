@@ -12,6 +12,7 @@ use crate::location::Location;
 use crate::ssh::{self, RemoteSource, SshRepair};
 use crate::store::check::{StoreCheck, check_store, finish_repair, put_repaired};
 use crate::store::digest::Digest;
+use crate::store::files::folder_size;
 use crate::store::gc::apply_retention;
 use crate::store::import::{ImportReport, import_group, legacy_names};
 use crate::store::recipe::{Recipe, RecipeInfo};
@@ -21,7 +22,7 @@ use crate::stream::{ChunkSource, RecipeStream, SourceRef};
 
 pub fn list(destination: &Location, job: Option<&str>) -> Result<Vec<RecipeInfo>> {
     match destination {
-        Location::Local(path) => Store::open(path)?.list_recipes(job),
+        Location::Local(path) => Store::open(path)?.list_sized(job),
         Location::Ssh(remote) => ssh::list(remote, job),
     }
 }
@@ -166,5 +167,13 @@ pub fn rename(from: &Location, to: &Location, old: &str, new: &str) -> Result<Re
             ssh::rename_job(remote, &source.path, old, new)
         }
         _ => bail!("{from} and {to} are not on one machine"),
+    }
+}
+
+/// The bytes the store at `destination` takes on its disk.
+pub fn usage(destination: &Location) -> Result<u64> {
+    match destination {
+        Location::Local(path) => folder_size(path),
+        Location::Ssh(remote) => ssh::usage(remote),
     }
 }

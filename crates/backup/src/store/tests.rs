@@ -440,3 +440,41 @@ fn one_read_imports_an_archive_into_every_folder_that_holds_it() {
         assert_eq!(fs::read(target.join("a.bin")).unwrap(), data);
     }
 }
+
+#[test]
+fn a_sized_listing_counts_only_the_data_a_backup_added() {
+    let temporary = tempdir().unwrap();
+    let source = temporary.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("world.db"), noise(3 * 1024 * 1024, 7)).unwrap();
+    fs::write(source.join("zeros.bin"), vec![0u8; 2 * 1024 * 1024]).unwrap();
+    let store = Store::open(&temporary.path().join("destination")).unwrap();
+    let (store, first) = backup(store, &source, "world");
+    fs::write(source.join("changed.db"), noise(1024 * 1024, 9)).unwrap();
+    let (mut store, second) = backup(store, &source, "world");
+
+    let listed = store.list_sized(Some("world")).unwrap();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].name, second.name);
+    let mut seen = HashSet::new();
+    let distinct: u64 = first
+        .chunks
+        .iter()
+        .filter(|chunk| seen.insert(chunk.id))
+        .map(|chunk| u64::from(chunk.size))
+        .sum();
+    assert_eq!(listed[1].new_size, Some(distinct));
+    let first_stored = listed[1].new_stored.unwrap();
+    assert!(
+        first_stored < distinct,
+        "zeros compress, {first_stored} of {distinct}"
+    );
+
+    let added = listed[0].new_size.unwrap();
+    assert!(
+        (1024 * 1024..4 * 1024 * 1024).contains(&added),
+        "the second backup added {added} of {}",
+        second.size
+    );
+    assert!(listed[0].new_stored.unwrap() <= added);
+}

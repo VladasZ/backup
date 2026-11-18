@@ -68,6 +68,10 @@ pub enum Command {
     Forget {
         job: String,
     },
+    /// The space each destination of a job takes on its disk.
+    Usage {
+        job: String,
+    },
     /// Gives a job a new name, with its backups in every destination.
     Rename {
         old: String,

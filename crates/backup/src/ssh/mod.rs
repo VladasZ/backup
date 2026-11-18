@@ -415,3 +415,13 @@ pub fn rename_job(remote: &SshLocation, from: &Path, old: &str, new: &str) -> Re
         },
     )
 }
+
+/// The bytes the store at `remote` takes, read by the agent.
+pub fn usage(remote: &SshLocation) -> Result<u64> {
+    simple_request(
+        remote,
+        &AgentRequest::Usage {
+            destination: remote.path.clone(),
+        },
+    )
+}

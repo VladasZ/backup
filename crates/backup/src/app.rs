@@ -205,6 +205,27 @@ fn execute(cli: Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Command::Usage { job } => {
+            let config = Config::load(&paths.config)?;
+            let operation_lock = AppLock::shared(&paths.operation_lock)?;
+            let usage = operations::usage(config.job(&job)?);
+            drop(operation_lock);
+            match output::format() {
+                Format::Json => output::emit_result(&usage)?,
+                Format::Text => {
+                    for destination in &usage {
+                        match (destination.bytes, &destination.error) {
+                            (Some(bytes), _) => println!("{} {bytes}", destination.destination),
+                            (None, Some(error)) => {
+                                println!("{} unreadable: {error}", destination.destination);
+                            }
+                            (None, None) => println!("{} unknown", destination.destination),
+                        }
+                    }
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Rename { old, new } => {
             let runner = Runner::new(Config::load(&paths.config)?, paths)?;
             let operation_lock = AppLock::exclusive(&runner.paths.operation_lock)?;

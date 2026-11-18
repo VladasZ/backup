@@ -596,6 +596,16 @@ fn a_job_renames_its_backups_on_an_ssh_destination() {
         fs::read_to_string(target.join("hello.txt")).expect("read restored file"),
         "renamed content"
     );
+    let listed = backup_ok(&root, &["--json", "list", "new-job"]);
+    assert!(
+        listed.contains("\"new_size\":") && !listed.contains("\"new_size\":null"),
+        "the remote listing has no new data size: {listed}"
+    );
+    let usage = backup_ok(&root, &["--json", "usage", "new-job"]);
+    assert!(
+        usage.contains("\"bytes\":") && !usage.contains("\"bytes\":null"),
+        "the agent read no size of the remote store: {usage}"
+    );
     let history = backup_ok(&root, &["history", "new-job"]);
     assert!(
         history.contains("new-job-"),

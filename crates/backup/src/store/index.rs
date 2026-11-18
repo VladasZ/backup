@@ -117,6 +117,12 @@ impl Index {
             .find(|entry| entry.id == *chunk)
     }
 
+    /// The bytes a chunk takes in its first pack, after compression.
+    pub fn stored_size(&self, chunk: &Digest) -> Option<u32> {
+        let pack = *self.chunks.get(chunk)?.first()?;
+        self.entry(&pack, chunk).map(|entry| entry.stored)
+    }
+
     pub fn entries(&self, pack: &Digest) -> Option<&[PackEntry]> {
         self.packs.get(pack).map(Vec::as_slice)
     }

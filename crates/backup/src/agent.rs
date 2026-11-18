@@ -24,6 +24,7 @@ use crate::protocol::{
 use crate::store::Store;
 use crate::store::check::{check_store, finish_repair, put_repaired};
 use crate::store::digest::Digest;
+use crate::store::files::folder_size;
 use crate::store::gc::apply_retention;
 use crate::store::import::{import_group, legacy_names};
 use crate::store::recipe::Recipe;
@@ -83,7 +84,7 @@ fn handle(request: AgentRequest, reader: &mut dyn BufRead) -> Result<()> {
         }
         AgentRequest::Receive { destination, job } => receive(reader, &destination, &job),
         AgentRequest::List { destination, job } => {
-            write_success(&Store::open(&destination)?.list_recipes(job.as_deref())?)
+            write_success(&Store::open(&destination)?.list_sized(job.as_deref())?)
         }
         AgentRequest::ReadRecipe { destination, name } => {
             write_success(&Store::open(&destination)?.read_recipe(&name)?)
@@ -117,6 +118,7 @@ fn handle(request: AgentRequest, reader: &mut dyn BufRead) -> Result<()> {
         AgentRequest::Import { destination, name } => {
             write_success(&import_group(&[destination], &name)?)
         }
+        AgentRequest::Usage { destination } => write_success(&folder_size(&destination)?),
         AgentRequest::RenameJob { from, to, old, new } => {
             write_success(&rename_job(&from, &to, &old, &new)?)
         }

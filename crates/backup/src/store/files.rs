@@ -40,6 +40,31 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     written
 }
 
+/// The bytes of every file under `path`, the space a store takes. A folder
+/// that does not exist takes none. Symlinks are not followed.
+pub fn folder_size(path: &Path) -> Result<u64> {
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read directory {}", path.display()));
+        }
+    };
+    let mut total = 0;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("read directory {}", path.display()))?;
+        let metadata = entry
+            .metadata()
+            .with_context(|| format!("read {}", entry.path().display()))?;
+        if metadata.is_dir() {
+            total += folder_size(&entry.path())?;
+        } else if metadata.is_file() {
+            total += metadata.len();
+        }
+    }
+    Ok(total)
+}
+
 pub fn sync_directory(directory: &Path) -> Result<()> {
     File::open(directory)
         .and_then(|handle| handle.sync_all())
@@ -139,7 +164,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{list, sweep_stale_partials, write_atomic};
+    use super::{folder_size, list, sweep_stale_partials, write_atomic};
 
     #[test]
     fn an_atomic_write_is_private_and_leaves_no_partial() {
@@ -155,6 +180,17 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn a_folder_size_counts_every_file_below_it() {
+        let temporary = tempdir().unwrap();
+        let root = temporary.path().join("store");
+        fs::create_dir_all(root.join("packs/ab")).unwrap();
+        fs::write(root.join("packs/ab/one.pack"), vec![1u8; 1000]).unwrap();
+        fs::write(root.join("recipes.recipe"), vec![2u8; 24]).unwrap();
+        assert_eq!(folder_size(&root).unwrap(), 1024);
+        assert_eq!(folder_size(&temporary.path().join("missing")).unwrap(), 0);
     }
 
     #[test]

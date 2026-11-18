@@ -419,6 +419,24 @@ includes timestamp, byte size, destination, and archive name. An
 unavailable destination is logged without hiding archives at healthy
 destinations.
 
+With `--json` each archive also has `new_size` and `new_stored`. `new_size` is
+the data the backup added to that destination compared with the backup of the
+same job before it, so the oldest backup of a job counts all its data as new.
+`new_stored` is that new data after compression, and null when the index of
+the store lacks one of its chunks.
+
+### Show the space a job takes
+
+```sh
+backup usage documents
+```
+
+Usage prints each destination of the job with the bytes its store takes on
+the disk, every file under the destination folder. Each destination is read
+on its own, a remote one by the agent. A destination that cannot be read
+prints `unreadable` with the error, and the others are still printed. The
+destinations are never added up, since each one holds its own older backups.
+
 ### Restore
 
 Restore the latest archive locally:
@@ -553,7 +571,9 @@ The final line of every `--json` command is a result envelope:
 ```
 
 Exit codes are unchanged, so `ok` mirrors the exit status. `status`,
-`history`, and `list` return arrays in `data`. `health` returns the health
+`history`, `list`, and `usage` return arrays in `data`. Each entry of `usage`
+is `{"destination","bytes","error"}`, with `bytes` null and `error` set for a
+destination that cannot be read. `health` returns the health
 report in `data` and still exits with 1 when unhealthy.
 
 `run`, `verify`, and `restore` stream progress events before the final
