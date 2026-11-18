@@ -5,6 +5,7 @@ mod stall;
 
 use std::collections::{HashSet, VecDeque};
 use std::io::Read;
+use std::path::Path;
 
 use anyhow::{Context, Error, Result, anyhow, bail};
 use serde_json::Value;
@@ -21,6 +22,7 @@ use crate::store::check::StoreCheck;
 use crate::store::digest::Digest;
 use crate::store::import::ImportReport;
 use crate::store::recipe::{Recipe, RecipeChunk, RecipeInfo};
+use crate::store::rename::RenameReport;
 use crate::stream::ChunkSource;
 use crate::transfer::Fanout;
 
@@ -396,6 +398,20 @@ pub fn import(remote: &SshLocation, name: &str) -> Result<ImportReport> {
         &AgentRequest::Import {
             destination: remote.path.clone(),
             name: name.to_owned(),
+        },
+    )
+}
+
+/// Renames the store of a job inside the agent. `remote` is the new folder,
+/// `from` the old one on the same machine.
+pub fn rename_job(remote: &SshLocation, from: &Path, old: &str, new: &str) -> Result<RenameReport> {
+    simple_request(
+        remote,
+        &AgentRequest::RenameJob {
+            from: from.to_path_buf(),
+            to: remote.path.clone(),
+            old: old.to_owned(),
+            new: new.to_owned(),
         },
     )
 }

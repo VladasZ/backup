@@ -11,7 +11,7 @@ use crate::store::digest::{DIGEST_LEN, Digest};
 use crate::store::recipe::Recipe;
 
 pub const RESPONSE_PREFIX: &str = "BACKUP/1 ";
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 const MAX_FRAME: usize = 1024 * 1024;
 
 const DATA: u8 = 1;
@@ -88,6 +88,13 @@ pub enum AgentRequest {
     Import {
         destination: PathBuf,
         name: String,
+    },
+    /// Answers with a `RenameReport`.
+    RenameJob {
+        from: PathBuf,
+        to: PathBuf,
+        old: String,
+        new: String,
     },
 }
 

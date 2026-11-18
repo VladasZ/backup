@@ -10,6 +10,7 @@ pub mod import;
 pub mod index;
 pub mod pack;
 pub mod recipe;
+pub mod rename;
 pub mod seal;
 
 #[cfg(test)]

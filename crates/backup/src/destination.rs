@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 use std::io::Read;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::archive::verify_stream;
 use crate::config::BackupJob;
@@ -15,6 +15,7 @@ use crate::store::digest::Digest;
 use crate::store::gc::apply_retention;
 use crate::store::import::{ImportReport, import_group, legacy_names};
 use crate::store::recipe::{Recipe, RecipeInfo};
+use crate::store::rename::{RenameReport, rename_job};
 use crate::store::{Store, StoreWriter};
 use crate::stream::{ChunkSource, RecipeStream, SourceRef};
 
@@ -154,4 +155,16 @@ pub fn import(destinations: &[Location], name: &str) -> Result<ImportReport> {
         }
     }
     report.context("no destination to import into")
+}
+
+/// Moves the store of job `old` from `from` to `to` and gives its backups the
+/// name `new`. Both folders are on one machine.
+pub fn rename(from: &Location, to: &Location, old: &str, new: &str) -> Result<RenameReport> {
+    match (from, to) {
+        (Location::Local(from), Location::Local(to)) => rename_job(from, to, old, new),
+        (Location::Ssh(source), Location::Ssh(remote)) if source.same_host(remote) => {
+            ssh::rename_job(remote, &source.path, old, new)
+        }
+        _ => bail!("{from} and {to} are not on one machine"),
+    }
 }

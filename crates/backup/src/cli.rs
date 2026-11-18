@@ -68,6 +68,11 @@ pub enum Command {
     Forget {
         job: String,
     },
+    /// Gives a job a new name, with its backups in every destination.
+    Rename {
+        old: String,
+        new: String,
+    },
     Health,
     Install,
     Uninstall,

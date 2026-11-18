@@ -85,9 +85,37 @@ pub fn parse_archive_name(name: &str) -> Option<ParsedArchive<'_>> {
     Some(ParsedArchive { job, created })
 }
 
+/// The name a backup of job `from` gets when the job is renamed to `to`, or
+/// `None` when the name belongs to another job.
+pub fn rename_archive(name: &str, from: &str, to: &str) -> Option<String> {
+    if parse_archive_name(name)?.job != from {
+        return None;
+    }
+    let rest = name.get(from.len()..)?;
+    Some(format!("{to}{rest}"))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_archive_name;
+    use super::{parse_archive_name, rename_archive};
+
+    const STAMP: &str = "-20260717T020000Z-11111111-1111-1111-1111-111111111111.tar.lz4";
+
+    #[test]
+    fn a_rename_keeps_the_time_and_the_id() {
+        let name = format!("valheim-hard{STAMP}");
+        assert_eq!(
+            rename_archive(&name, "valheim-hard", "arkham-asylum").unwrap(),
+            format!("arkham-asylum{STAMP}")
+        );
+    }
+
+    /// `valheim` must not take the backups of `valheim-hard`.
+    #[test]
+    fn a_rename_leaves_a_job_that_only_starts_the_same() {
+        let name = format!("valheim-hard{STAMP}");
+        assert!(rename_archive(&name, "valheim", "durka").is_none());
+    }
 
     #[test]
     fn a_job_name_containing_dashes_still_parses() {

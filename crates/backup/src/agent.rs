@@ -27,6 +27,7 @@ use crate::store::digest::Digest;
 use crate::store::gc::apply_retention;
 use crate::store::import::{import_group, legacy_names};
 use crate::store::recipe::Recipe;
+use crate::store::rename::rename_job;
 
 pub fn run(paths: &AppPaths) -> Result<()> {
     paths.ensure()?;
@@ -115,6 +116,9 @@ fn handle(request: AgentRequest, reader: &mut dyn BufRead) -> Result<()> {
         AgentRequest::Legacy { destination } => write_success(&legacy_names(&destination)?),
         AgentRequest::Import { destination, name } => {
             write_success(&import_group(&[destination], &name)?)
+        }
+        AgentRequest::RenameJob { from, to, old, new } => {
+            write_success(&rename_job(&from, &to, &old, &new)?)
         }
     }
 }

@@ -9,6 +9,7 @@ const BINARY: &str = env!("CARGO_BIN_EXE_backup");
 const IMAGE: &str = "backup-test-sshd:1";
 const CONTAINER: &str = "backup-test-sshd";
 const COPY_CONTAINER: &str = "backup-test-sshd-copy";
+const RENAME_CONTAINER: &str = "backup-test-sshd-rename";
 const READY_WAIT: Duration = Duration::from_secs(60);
 
 fn workspace_root() -> PathBuf {
@@ -531,5 +532,73 @@ fn a_copied_agent_works_without_one_installed() {
     assert!(
         cached.contains("agent-"),
         "the agent was not copied to the remote:\n{cached}"
+    );
+}
+
+/// The agent moves the store and renames the backups on the remote, and the
+/// job restores under its new name.
+#[test]
+fn a_job_renames_its_backups_on_an_ssh_destination() {
+    if !docker_available() {
+        eprintln!("skipping: docker is not available");
+        return;
+    }
+
+    let sandbox = tempfile::tempdir().expect("create sandbox");
+    let root = sandbox.path().to_path_buf();
+    for directory in ["home", "state", "source", "restored"] {
+        fs::create_dir_all(root.join(directory)).expect("create sandbox directory");
+    }
+    fs::write(root.join("source/hello.txt"), "renamed content").expect("write local source");
+    let remote = RemoteHost::start(&root, RENAME_CONTAINER);
+    let source = root.join("source").display().to_string();
+
+    write_config(
+        &root,
+        &Case {
+            name: "old-job",
+            source: source.clone(),
+            destination: remote.uri("/srv/old-job"),
+        },
+    );
+    backup_ok(&root, &["run", "old-job"]);
+    let renamed = backup_ok(&root, &["rename", "old-job", "new-job"]);
+    assert!(renamed.contains("renamed old-job to new-job"), "{renamed}");
+
+    assert_eq!(remote.exec("ls /srv"), "new-job");
+    let recipes = remote.exec("ls /srv/new-job/recipes");
+    assert!(
+        recipes.starts_with("new-job-") && !recipes.contains("old-job"),
+        "the recipe kept its old name: {recipes}"
+    );
+
+    write_config(
+        &root,
+        &Case {
+            name: "new-job",
+            source,
+            destination: remote.uri("/srv/new-job"),
+        },
+    );
+    backup_ok(&root, &["verify", "new-job"]);
+    let target = root.join("restored/new-job");
+    backup_ok(
+        &root,
+        &[
+            "restore",
+            "new-job",
+            "--to",
+            target.to_str().expect("restore path"),
+            "--yes",
+        ],
+    );
+    assert_eq!(
+        fs::read_to_string(target.join("hello.txt")).expect("read restored file"),
+        "renamed content"
+    );
+    let history = backup_ok(&root, &["history", "new-job"]);
+    assert!(
+        history.contains("new-job-"),
+        "the history kept the old name:\n{history}"
     );
 }

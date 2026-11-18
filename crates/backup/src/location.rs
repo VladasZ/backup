@@ -35,6 +35,22 @@ impl Location {
         matches!(self, Self::Local(_))
     }
 
+    /// The last folder name, the job name in a destination that holds one job.
+    pub fn folder_name(&self) -> Option<&str> {
+        self.path().file_name()?.to_str()
+    }
+
+    /// The folder next to this one with another name, on the same machine.
+    pub fn sibling(&self, name: &str) -> Self {
+        match self {
+            Self::Local(path) => Self::Local(path.with_file_name(name)),
+            Self::Ssh(remote) => Self::Ssh(SshLocation {
+                path: remote.path.with_file_name(name),
+                ..remote.clone()
+            }),
+        }
+    }
+
     pub fn contains(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Local(parent), Self::Local(child)) => child.starts_with(parent),

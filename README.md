@@ -509,6 +509,26 @@ backup prune documents
 Prune applies current retention to every job or only the selected job. Jobs
 without retention remain unchanged.
 
+### Rename a job
+
+```sh
+backup rename documents papers
+```
+
+Rename gives a job a new name, with its backups. In every destination whose
+last folder is named after the job, that folder gets the new name, so
+`/backups/documents` becomes `/backups/papers`. A destination that several
+jobs share keeps its folder. Every backup of the job gets the new name, its
+time and its content stay. The history and the pending state of the job move
+to the new name, the schedule and the verify times are copied.
+
+Either name may be the one in the configuration, so a rename that stopped
+halfway finishes when it runs again. Run it before the configuration names
+the new job: the daemon backs up a job it has no schedule for at once, into
+an empty store. Rename refuses while a delivery of the job still waits, while
+a destination holds old archives of the job to import, and when the folder
+under the new name already holds files, it never merges 2 stores.
+
 ### Run the daemon in the foreground
 
 ```sh

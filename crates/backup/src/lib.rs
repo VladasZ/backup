@@ -17,6 +17,7 @@ pub mod output;
 pub mod paths;
 pub mod pre;
 pub mod protocol;
+pub mod rename;
 pub mod repair;
 pub mod retention;
 pub mod runner;

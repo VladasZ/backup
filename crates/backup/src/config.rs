@@ -71,19 +71,20 @@ impl Config {
     }
 }
 
+pub fn check_job_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
+    {
+        bail!("job name {name:?} may contain only letters, numbers, '.', '_', and '-'");
+    }
+    Ok(())
+}
+
 impl BackupJob {
     pub fn validate(&self) -> Result<()> {
-        if self.name.is_empty()
-            || !self
-                .name
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
-        {
-            bail!(
-                "job name {:?} may contain only letters, numbers, '.', '_', and '-'",
-                self.name
-            );
-        }
+        check_job_name(&self.name)?;
         if self.destinations.is_empty() {
             bail!("job {:?} must have at least one destination", self.name);
         }

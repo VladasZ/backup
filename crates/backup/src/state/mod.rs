@@ -1,4 +1,5 @@
 mod records;
+mod rename;
 mod store;
 
 #[cfg(test)]

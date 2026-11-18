@@ -17,6 +17,7 @@ use crate::logs;
 use crate::operations::{self, ArchiveEntry};
 use crate::output::{self, Format};
 use crate::paths::AppPaths;
+use crate::rename;
 use crate::runner::{HISTORY_DAYS, Runner};
 use crate::service;
 use crate::state::{HistoryLine, StatusLine};
@@ -200,6 +201,31 @@ fn execute(cli: Cli) -> Result<ExitCode> {
                     for archive in &report.cancelled {
                         println!("cancelled pending deliveries for {archive}");
                     }
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Rename { old, new } => {
+            let runner = Runner::new(Config::load(&paths.config)?, paths)?;
+            let operation_lock = AppLock::exclusive(&runner.paths.operation_lock)?;
+            let result = rename::rename(&runner.config, &runner.state, &old, &new);
+            drop(operation_lock);
+            let report = result?;
+            match output::format() {
+                Format::Json => output::emit_result(&report)?,
+                Format::Text => {
+                    for destination in &report.destinations {
+                        let folder = if destination.moved {
+                            "moved"
+                        } else {
+                            "already in place"
+                        };
+                        println!(
+                            "{} -> {}: folder {folder}, {} backup(s) renamed",
+                            destination.from, destination.to, destination.recipes
+                        );
+                    }
+                    println!("renamed {old} to {new}");
                 }
             }
             Ok(ExitCode::SUCCESS)
